@@ -12,7 +12,7 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done & verified · `[!]`
 | 0 | Scaffold Next.js app + layout + config env | `[x]` | `typecheck` 0 · `lint` 0 · `build` 0 (static `/`) · dev `GET / 200` |
 | 1 | Domain types, zod schemas, status derivation, config | `[x]` | `typecheck` 0 · `npm test` 26/26 pass (5 suites, 0 fail) |
 | 2 | DB layer (schema, repository, latest read model) | `[x]` | 12 db tests pass; typecheck, lint, build green |
-| 3 | `POST /api/ingest` | `[ ]` | — |
+| 3 | `POST /api/ingest` | `[x]` | typecheck 0 · 52/52 tests (14 new) · lint 0 · build 0 (`ƒ /api/ingest`) · 8-case curl matrix correct |
 | 4 | `GET /api/fleet` | `[ ]` | — |
 | 5 | `GET /api/robots/:id` | `[ ]` | — |
 | 6 | SSE `/api/stream` | `[ ]` | — |
@@ -131,6 +131,63 @@ curated name; empty batch.
 change; `node:sqlite` works on Node 22.23 but requires `--experimental-sqlite` and prints an
 `ExperimentalWarning`, which a Next route worker does not get.
 
+## Task 3 plan — the ingest endpoint
+
+Goal: the one door into the store. Authentication, request size and partial failure are the whole
+problem; the happy path is eight lines. Visual plan: `.lavish/task-3-plan.html`.
+
+| File | Contents |
+|---|---|
+| `app/api/ingest/route.ts` | Adapter only: resolve `db`, `config.ingestApiKey` and `Date.now()`, then delegate. No `runtime` export — `cacheComponents` rejects one, including `runtime = 'nodejs'`. |
+| `lib/http/ingest.ts` | `handleIngest(request, { db, expectedKey, now })`. Five gates: key → size/JSON → body shape → per-report validation → store. Plain Web `Response`, no `next/*` import, so tests call it directly. |
+| `lib/http/auth.ts` | `hasValidIngestKey(provided, expected)`: SHA-256 both sides, then `timingSafeEqual`, so neither a missing header nor a length difference leaks anything. |
+| `tests/ingest.test.ts` | 14 cases against a temp database with a pinned `now`. |
+
+**Outcome table (first match wins):** 401 `unauthorized` (before the body is read) · 413
+`payload_too_large` · 400 `invalid_json` · 400 `invalid_body` · 400 `empty_batch` · 400
+`batch_too_large` (>500) · 400 `invalid_reports` (only when every report fails) · 200
+`{ accepted, duplicates, rejected: [{ index, reason }] }` including all-duplicate batches.
+
+**Partial success is the core requirement.** Task 1's `ingestBodySchema` validates the envelope
+as a whole, so one bad robot would drop the batch; the route checks the envelope's shape lightly
+and runs `reportSchema.safeParse` per report. `index` is the request position and `reason` comes
+from `describeIssues`, so task 7's simulator can log exactly which robot to fix.
+
+**Gate:** `npm run typecheck` · `npm test` (52 expected: 38 + 14) · `npm run lint` · `npm run build`
+(`ƒ /api/ingest` must appear in the route table) · then the 8-command curl matrix against
+`npm run dev`: single report, replay, no key, wrong key, malformed JSON, mixed batch, older `seq`,
+501 reports.
+
+**Decisions (confirmed 2026-11-21):** thin route + `lib/http/ingest.ts`; an all-invalid batch is
+400 `invalid_reports`; an empty `reports: []` is 400 `empty_batch`.
+
+**Verified in the bundled Next 16 docs before planning:** route handlers are uncached by default;
+unsupported methods get an automatic 405; the Web `Request`/`Response` APIs with
+`Response.json(...)` are the documented idiom; and with `cacheComponents` enabled any `runtime`
+route segment config must be removed, including `runtime = 'nodejs'`.
+
+### Gate output (task 3, 2026-11-21)
+
+`npm run typecheck` 0 · `npm test` **52/52 pass** (14 new, 7 suites) · `npm run lint` 0 ·
+`npm run build` 0 with the route table `○ /`, `○ /_not-found`, `ƒ /api/ingest`.
+
+Live matrix against `npm run dev` on port 3100, temp DB / temp key (`INGEST_API_KEY=matrix-key`):
+
+```text
+1 valid single report         200  {"accepted":1,"duplicates":0,"rejected":[]}
+2 replay same report          200  {"accepted":0,"duplicates":1,"rejected":[]}
+3 missing key                 401  unauthorized
+4 wrong key                   401  unauthorized
+5 malformed JSON              400  invalid_json
+6 mixed batch, 1 bad battery  200  {"accepted":2,"duplicates":0,"rejected":[{"index":1,"reason":"battery: Too big: expected number to be <=100"}]}
+7 out-of-order older seq      200  {"accepted":1,...} — robot_latest stayed seq=2/battery=90, telemetry kept seq=0
+8 501 reports                 400  batch_too_large {received:501,limit:500}
+```
+
+Stored state after the matrix: `robot_latest` = RBT-001 seq 2 (battery 90) and RBT-003 seq 1;
+`telemetry` = 4 rows with RBT-001 spanning seq 0–2. One log line per accepted request:
+`ingest received=3 accepted=2 duplicates=0 rejected=1 ms=0`. Dev server stopped, port 3100 closed.
+
 ## Log
 
 - **2026-11-21 — planning.** Repo was empty (single initial commit). Environment: Node 22.23,
@@ -175,6 +232,19 @@ change; `node:sqlite` works on Node 22.23 but requires `--experimental-sqlite` a
   `busy_timeout=5000` + `foreign_keys=ON`, one transaction per batch, `ON CONFLICT DO NOTHING` for
   duplicates and a `WHERE excluded.seq > robot_latest.seq` guard so a late report cannot rewind the
   read model. Gate: typecheck 0, test 38/38 (12 new), lint 0, build 0.
+
+- **2026-11-21 — task 3 planned.** Ingest endpoint designed in `.lavish/task-3-plan.html`: five
+  gates, eight outcomes, timing-safe key comparison, per-report validation for partial success, and
+  a 14-case gate that calls the handler directly with a temp DB. Read the bundled route-handler and
+  `cacheComponents` docs first (no `runtime` export allowed). Three decisions left open: handler
+  placement, all-invalid batch status, empty batch status.
+
+- **2026-11-21 — task 3 done.** `POST /api/ingest` as `app/api/ingest/route.ts` (adapter) +
+  `lib/http/ingest.ts` (five gates) + `lib/http/auth.ts` (hashed `timingSafeEqual`), with 14 cases in
+  `tests/ingest.test.ts`. Gate: typecheck, 52/52 tests, lint and build green; all eight curl cases
+  matched the contract, including a 401 that never parsed the body and a late report that landed in
+  history without rewinding `robot_latest`. Decisions: thin route, 400 for all-invalid and empty
+  batches.
 
 ## Known limitations / open questions
 
