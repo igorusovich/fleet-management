@@ -14,7 +14,7 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done & verified · `[!]`
 | 2 | DB layer (schema, repository, latest read model) | `[x]` | 12 db tests pass; typecheck, lint, build green |
 | 3 | `POST /api/ingest` | `[x]` | typecheck 0 · 52/52 tests (14 new) · lint 0 · build 0 (`ƒ /api/ingest`) · 8-case curl matrix correct |
 | 4 | `GET /api/fleet` | `[x]` | typecheck 0 · 65/65 tests (13 new) · lint 0 · build 0 (`ƒ /api/fleet`) · 7-case curl matrix correct |
-| 5 | `GET /api/robots/:id` | `[ ]` | — |
+| 5 | `GET /api/robots/:id` | `[x]` | typecheck 0 · 80/80 tests (15 new) · lint 0 · build 0 (`ƒ /api/robots/[id]`) · 25-check curl matrix passed |
 | 6 | SSE `/api/stream` | `[ ]` | — |
 | 7 | Robot simulator CLI | `[ ]` | — |
 | 8 | Fleet overview UI | `[ ]` | — |
@@ -229,6 +229,58 @@ prerendering stops on `req.url`, database queries and `Date.now()`, all of which
 So the route stays dynamic with no `dynamic` or `runtime` export, and unsupported methods still get
 Next's automatic 405.
 
+## Task 5 plan — one robot in detail
+
+Goal: the read behind the detail screen. Only one of its four statements is a lookup; the rest scan
+someone's last N minutes of history, so the work is bounding that window, fixing its resolution, and
+deriving events and stats without pulling raw rows into JavaScript. Visual plan:
+`.lavish/task-5-plan.html`.
+
+| File | Contents |
+|---|---|
+| `app/api/robots/[id]/route.ts` | Adapter: `await ctx.params`, `getDb()`, `config.thresholds`, `Date.now()` → `handleRobot`, typed `RouteContext<"/api/robots/[id]">`. No `runtime`/`dynamic` export. |
+| `lib/http/robot.ts` | `handleRobot(request, id, { db, thresholds, now })`: resolve the window, read state, bucket, collect events, compute stats, assemble; 404 and 400 branches. |
+| `lib/db/telemetry.ts` | `getRobot`, `listBuckets`, `listEvents`, `windowStats` — four prepared statements, all riding `telemetry_robot_received`. |
+| `tests/robot.test.ts` | 15 handler cases on a temp database with a pinned `now`; every one runs the real SQL. |
+
+**Response:** `{ generatedAt, window: {requested, ms, bucketMs, from, to}, thresholds, robot,
+state, history[], trail[], events[], stats }`. `robot` is metadata with the same `COALESCE` fallbacks
+as a fleet row; `state` is the read model plus `status` and clamped `ageMs`; `history` is
+`{t, battery, charging, speed}`; `trail` is `{t, x, y}`; `events` are
+`{t, kind, detail}` for `fault`, `charge_start`, `comms_gap`.
+
+**Downsampling:** buckets come from the ladder `{0.5s, 1s, 2s, 5s, 10s, 15s, 30s, 1m, 2m, 5m, 10m}`,
+taking the smallest that keeps the window at or under 180 points — which lands on exactly the 5 s
+PLAN §5 documents for the default 15 m. Buckets are epoch-aligned on `received_at`, so a point keeps
+its `t` between polls; each holds `avg(battery)`, `max(speed)`, any-charging, and the mean position.
+Empty buckets are omitted rather than zero-filled.
+
+**Events:** edges only, found with `LAG` inside the same range scan — a new or changed `error_code`,
+`charging` going false→true, and a gap above `OFFLINE_AFTER_MS` (the same threshold the status ladder
+uses). Newest first, capped at 200. A transition with no predecessor row in the window is not
+reported; a live fault is still visible in `state.errorCode`.
+
+**Stats:** one statement over raw rows — `count(*)`, `round(avg(battery))`, `distanceM` from `sqrt`
+with gap-spanning segments excluded, and `gapCount`. Checked against the installed driver before
+planning: SQLite 3.54.1, `sqrt(16)` = 4, `lag()` works.
+
+**Gate:** `npm run typecheck` · `npm test` (80 expected: 65 + 15) · `npm run lint` · `npm run build`
+(`ƒ /api/robots/[id]`) · then 7 curl calls on a backdated temp DB: default window, `1h`, `7m` → 400,
+blank window, unknown id → 404, `POST` → 405, and two calls a second apart showing `generatedAt` move
+while bucket `t` values do not.
+
+**Open decisions (Lavish):** window input (allowlist of six — recommended — vs free-form capped at
+24h vs fixed 15m) · bucket rule (ladder ≤180 points — recommended — vs fixed 5 s vs raw rows capped)
+· event source (SQL `LAG` — recommended — vs JS reduce vs an events table written at ingest) · window
+clock (`received_at` — recommended — vs `device_ts`).
+
+**Built (2026-11-21):** approved as planned and shipped. One fix came out of the gate: SQLite bound
+the epoch-millisecond parameters as REAL, so `(received_at / bucketMs) * bucketMs` returned
+ungrouped rows — 900 samples became 900 points. Bucket starts are now
+`received_at - (received_at % bucketMs)`, which is exact and independent of how a number is bound.
+The 15 m worst case is 181 aligned buckets, not 180: the cap bounds intervals, and an inclusive
+range on an exact multiple adds the edge bucket.
+
 ## Log
 
 - **2026-11-21 — planning.** Repo was empty (single initial commit). Environment: Node 22.23,
@@ -326,6 +378,18 @@ GET /api/ingest                 405  automatic method rejection
 Ages read back as 542 ms / 4 042 ms / 11 042 ms against thresholds of 3 000 / 10 000, so `moving`,
 `delayed` and `offline` came from the real clock path rather than pinned fixtures; every robot
 reported `samplesLastMinute: 1`. Server stopped, port 3100 closed.
+
+- **2026-11-21 — task 5 planned.** Robot detail designed in `.lavish/task-5-plan.html`: one state
+  read plus three window queries, a six-value window allowlist, ladder buckets that reproduce PLAN's
+  5 s at the default 15 m, edge events via `LAG`, and stats computed entirely in SQL. Verified before
+  writing: SQLite 3.54.1 has window functions and `sqrt`, and Next 16 route handlers take params as a
+  Promise through `RouteContext<\"/api/robots/[id]\">`. Four decisions left open.
+
+- **2026-11-21 — task 5 done.** `GET /api/robots/:id` ships with a six-value window allowlist, a
+  bucket ladder (15 m → 5 s, 24 h → 10 m), edge-only events via `LAG`, and window stats in one
+  statement. Gate: typecheck 0, 80/80 tests (15 new), lint 0, build 0 with `ƒ /api/robots/[id]`, and
+  a 25-check matrix against `next start` — default, 1 h and blank windows, 400 on `7m`, 404 on an
+  unknown id, 405 on POST, and bucket starts stable across two polls a second apart.
 
 ## Known limitations / open questions
 

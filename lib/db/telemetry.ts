@@ -215,6 +215,10 @@ interface Statements {
   selectAll: Database.Statement<[], LatestRowDb>;
   selectOne: Database.Statement<[string], LatestRowDb>;
   selectFleet: Database.Statement<FleetParams, FleetRowDb>;
+  selectRobot: Database.Statement<RobotIdParams, RobotRowDb>;
+  selectBuckets: Database.Statement<BucketParams, BucketRowDb>;
+  selectEvents: Database.Statement<EventParams, EventRowDb>;
+  selectStats: Database.Statement<StatsParams, StatsRowDb>;
 }
 
 /**
@@ -233,6 +237,10 @@ function statements(db: Database.Database): Statements {
       selectAll: db.prepare<[], LatestRowDb>(SELECT_LATEST_ALL),
       selectOne: db.prepare<[string], LatestRowDb>(SELECT_LATEST_ONE),
       selectFleet: db.prepare<FleetParams, FleetRowDb>(SELECT_FLEET),
+      selectRobot: db.prepare<RobotIdParams, RobotRowDb>(SELECT_ROBOT),
+      selectBuckets: db.prepare<BucketParams, BucketRowDb>(SELECT_BUCKETS),
+      selectEvents: db.prepare<EventParams, EventRowDb>(SELECT_EVENTS),
+      selectStats: db.prepare<StatsParams, StatsRowDb>(SELECT_WINDOW_STATS),
     };
     statementCache.set(db, cached);
   }
@@ -364,4 +372,309 @@ export function listFleet(
   return statements(db)
     .selectFleet.all({ windowStart: options.now - windowMs })
     .map(toFleetRow);
+}
+
+/* -------------------------------------------------------------------------- *
+ * Robot detail (task 5): one state read plus three reads over a time window.
+ *
+ * All four ride `telemetry_robot_received` (migration 2), and each keeps its
+ * work in SQLite: the bucket group-by, the `LAG` edge detection and the `sqrt`
+ * travelled distance never move raw rows into JavaScript. That is what keeps a
+ * 24 h window at four queries instead of 86 400 hydrated objects.
+ * -------------------------------------------------------------------------- */
+
+/** One robot's read model, with the same metadata fallbacks as a fleet row. */
+export interface RobotRow {
+  robotId: string;
+  name: string;
+  siteId: string;
+  model: string;
+  seq: number;
+  deviceTs: number;
+  receivedAt: number;
+  battery: number;
+  charging: boolean;
+  motion: MotionState;
+  x: number;
+  y: number;
+  heading: number;
+  speed: number;
+  errorCode: string | null;
+}
+
+interface RobotRowDb {
+  robot_id: string;
+  name: string;
+  site_id: string;
+  model: string;
+  seq: number;
+  device_ts: number;
+  received_at: number;
+  battery: number;
+  charging: number;
+  motion: MotionState;
+  x: number;
+  y: number;
+  heading: number;
+  speed: number;
+  error_code: string | null;
+}
+
+/** What a chart point and a trail point have in common. */
+export interface BucketRow {
+  /** Bucket start, epoch-aligned to `bucketMs`. */
+  t: number;
+  battery: number;
+  speed: number;
+  charging: boolean;
+  x: number;
+  y: number;
+}
+
+interface BucketRowDb {
+  t: number;
+  battery: number;
+  speed: number;
+  charging: number;
+  x: number;
+  y: number;
+}
+
+export type RobotEventKind = "fault" | "charge_start" | "comms_gap";
+
+/** An edge in the telemetry, not a sample: one entry per transition. */
+export interface EventRow {
+  t: number;
+  kind: RobotEventKind;
+  /** The new error code, or a readable gap length; `null` for a charge start. */
+  detail: string | null;
+}
+
+interface EventRowDb {
+  t: number;
+  kind: RobotEventKind;
+  detail: string | null;
+}
+
+/** Totals over the raw rows in the window. */
+export interface WindowStats {
+  reports: number;
+  /** `null` when the window is empty, so the UI does not plot a fake 0 %. */
+  avgBattery: number | null;
+  distanceM: number;
+  gapCount: number;
+}
+
+interface StatsRowDb {
+  reports: number;
+  avg_battery: number | null;
+  distance_m: number;
+  gap_count: number;
+}
+
+interface RobotIdParams {
+  robotId: string;
+}
+
+interface BucketParams extends RobotIdParams {
+  bucketMs: number;
+  from: number;
+  to: number;
+}
+
+interface EventParams extends BucketParams {
+  offlineAfterMs: number;
+  limit: number;
+}
+
+interface StatsParams extends BucketParams {
+  offlineAfterMs: number;
+}
+
+/** The same join as `SELECT_FLEET`, narrowed to one id and without the count. */
+const SELECT_ROBOT = `
+  SELECT
+    l.robot_id                        AS robot_id,
+    COALESCE(r.name, l.robot_id)      AS name,
+    COALESCE(r.site_id, 'unassigned') AS site_id,
+    COALESCE(r.model, 'unknown')      AS model,
+    l.seq,
+    l.device_ts,
+    l.received_at,
+    l.battery,
+    l.charging,
+    l.motion,
+    l.x,
+    l.y,
+    l.heading,
+    l.speed,
+    l.error_code
+  FROM robot_latest l
+  LEFT JOIN robots r ON r.id = l.robot_id
+  WHERE l.robot_id = @robotId
+`;
+
+/**
+ * One row per bucket. `t` is `received_at` minus its remainder, not a division:
+ * the modulo is exact for positive epoch milliseconds, whereas a division whose
+ * operands arrive as REAL (the driver binds large numbers as doubles) would
+ * leave every row in a bucket of its own. Either way `t` is stable between
+ * polls, so a point that already exists does not shift when a report lands.
+ *
+ * `max(charging)` reads as "this bucket contained charging time", and the mean
+ * position is the segment's midpoint for the trail.
+ */
+const SELECT_BUCKETS = `
+  SELECT
+    received_at - (received_at % @bucketMs) AS t,
+    round(avg(battery), 1)                AS battery,
+    max(speed)                            AS speed,
+    max(charging)                         AS charging,
+    round(avg(x), 2)                      AS x,
+    round(avg(y), 2)                      AS y
+  FROM telemetry
+  WHERE robot_id = @robotId AND received_at >= @from AND received_at <= @to
+  GROUP BY t
+  ORDER BY t
+`;
+
+/**
+ * Edges only, in one pass: `lag()` gives every row its predecessor, and the
+ * three branches turn the differences into rows. `IS NOT` rather than `<>` so a
+ * cleared code (`E_STUCK` → `NULL`) is not lost to SQL's three-valued logic.
+ *
+ * A transition whose predecessor sits just outside the window is not reported;
+ * `state` still shows what the robot is doing right now.
+ */
+const SELECT_EVENTS = `
+  WITH ordered AS (
+    SELECT
+      received_at,
+      error_code,
+      charging,
+      lag(error_code)  OVER (ORDER BY received_at, seq) AS prev_error_code,
+      lag(charging)    OVER (ORDER BY received_at, seq) AS prev_charging,
+      lag(received_at) OVER (ORDER BY received_at, seq) AS prev_received_at
+    FROM telemetry
+    WHERE robot_id = @robotId AND received_at >= @from AND received_at <= @to
+  )
+  SELECT received_at AS t, 'fault' AS kind, error_code AS detail
+    FROM ordered
+    WHERE error_code IS NOT NULL AND error_code IS NOT prev_error_code
+  UNION ALL
+  SELECT received_at, 'charge_start', NULL
+    FROM ordered
+    WHERE charging = 1 AND prev_charging = 0
+  UNION ALL
+  SELECT received_at, 'comms_gap', printf('no reports for %.1fs', (received_at - prev_received_at) / 1000.0)
+    FROM ordered
+    WHERE prev_received_at IS NOT NULL AND received_at - prev_received_at > @offlineAfterMs
+  ORDER BY t DESC, kind
+  LIMIT @limit
+`;
+
+/**
+ * Window totals. The distance is the sum of segment lengths, and a segment that
+ * spans a comms gap is skipped: the robot did not teleport, we just do not know
+ * the path it took, and including the straight line would inflate the number.
+ *
+ * `coalesce(..., 0)` keeps an empty window from answering `null` for the two
+ * values the UI reads as a number.
+ */
+const SELECT_WINDOW_STATS = `
+  WITH ordered AS (
+    SELECT
+      received_at,
+      battery,
+      x,
+      y,
+      lag(x)           OVER (ORDER BY received_at, seq) AS prev_x,
+      lag(y)           OVER (ORDER BY received_at, seq) AS prev_y,
+      lag(received_at) OVER (ORDER BY received_at, seq) AS prev_received_at
+    FROM telemetry
+    WHERE robot_id = @robotId AND received_at >= @from AND received_at <= @to
+  )
+  SELECT
+    count(*) AS reports,
+    round(avg(battery), 1) AS avg_battery,
+    round(coalesce(sum(
+      CASE
+        WHEN prev_received_at IS NOT NULL
+         AND received_at - prev_received_at <= @offlineAfterMs
+        THEN sqrt((x - prev_x) * (x - prev_x) + (y - prev_y) * (y - prev_y))
+      END
+    ), 0), 1) AS distance_m,
+    coalesce(sum(
+      CASE
+        WHEN prev_received_at IS NOT NULL
+         AND received_at - prev_received_at > @offlineAfterMs
+        THEN 1 ELSE 0
+      END
+    ), 0) AS gap_count
+  FROM ordered
+`;
+
+/** How many events a detail response carries; the newest ones win. */
+export const EVENT_LIMIT = 200;
+
+function toRobotRow(row: RobotRowDb): RobotRow {
+  return {
+    robotId: row.robot_id,
+    name: row.name,
+    siteId: row.site_id,
+    model: row.model,
+    seq: row.seq,
+    deviceTs: row.device_ts,
+    receivedAt: row.received_at,
+    battery: row.battery,
+    charging: row.charging === 1,
+    motion: row.motion,
+    x: row.x,
+    y: row.y,
+    heading: row.heading,
+    speed: row.speed,
+    errorCode: row.error_code,
+  };
+}
+
+/** One robot's state, or `null` if it has never reported. */
+export function getRobot(db: Database.Database, robotId: string): RobotRow | null {
+  const row = statements(db).selectRobot.get({ robotId });
+  return row === undefined ? null : toRobotRow(row);
+}
+
+/** Downsampled history for `[from, to]`, oldest bucket first. */
+export function listBuckets(
+  db: Database.Database,
+  options: BucketParams,
+): BucketRow[] {
+  return statements(db)
+    .selectBuckets.all(options)
+    .map((row) => ({
+      t: row.t,
+      battery: row.battery,
+      speed: row.speed,
+      charging: row.charging === 1,
+      x: row.x,
+      y: row.y,
+    }));
+}
+
+/** Edges in `[from, to]`, newest first, capped at `limit`. */
+export function listEvents(
+  db: Database.Database,
+  options: Omit<EventParams, "limit"> & { limit?: number },
+): EventRow[] {
+  return statements(db).selectEvents.all({ ...options, limit: options.limit ?? EVENT_LIMIT });
+}
+
+/** Totals over the raw rows in `[from, to]`. */
+export function readWindowStats(db: Database.Database, options: StatsParams): WindowStats {
+  const row = statements(db).selectStats.get(options);
+  return {
+    reports: row?.reports ?? 0,
+    avgBattery: row?.avg_battery ?? null,
+    distanceM: row?.distance_m ?? 0,
+    gapCount: row?.gap_count ?? 0,
+  };
 }
