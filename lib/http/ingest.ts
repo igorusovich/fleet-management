@@ -62,7 +62,16 @@ export interface IngestDeps {
   readonly now: number;
   /** One structured line per accepted request. Silent in tests. */
   readonly log?: (line: string) => void;
+  /**
+   * Fired only when at least one report was stored, so the live stream can drop
+   * its cached snapshot and show the report on the next frame. Duplicates and
+   * rejected reports do not fire it: nothing readable changed.
+   */
+  readonly onAccepted?: (stored: IngestResult) => void;
 }
+
+/** What the store reports back for one batch. */
+export type IngestResult = Awaited<ReturnType<typeof ingestReports>>;
 
 function errorResponse(
   status: number,
@@ -184,6 +193,8 @@ export async function handleIngest(request: Request, deps: IngestDeps): Promise<
     `ingest received=${items.length} accepted=${stored.accepted} duplicates=${stored.duplicates}` +
       ` rejected=${rejected.length} ms=${elapsedMs}`,
   );
+
+  if (stored.accepted > 0) deps.onAccepted?.(stored);
 
   const responseBody: IngestResponseBody = {
     accepted: stored.accepted,

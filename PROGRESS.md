@@ -15,7 +15,7 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done & verified · `[!]`
 | 3 | `POST /api/ingest` | `[x]` | typecheck 0 · 52/52 tests (14 new) · lint 0 · build 0 (`ƒ /api/ingest`) · 8-case curl matrix correct |
 | 4 | `GET /api/fleet` | `[x]` | typecheck 0 · 65/65 tests (13 new) · lint 0 · build 0 (`ƒ /api/fleet`) · 7-case curl matrix correct |
 | 5 | `GET /api/robots/:id` | `[x]` | typecheck 0 · 80/80 tests (15 new) · lint 0 · build 0 (`ƒ /api/robots/[id]`) · 25-check curl matrix passed |
-| 6 | SSE `/api/stream` | `[ ]` | — |
+| 6 | SSE `/api/stream` | `[x]` | typecheck 0 · 96/96 tests (16 new) · lint 0 · build 0 (`ƒ /api/stream`) · wire matrix: moving → delayed → offline with no writes |
 | 7 | Robot simulator CLI | `[ ]` | — |
 | 8 | Fleet overview UI | `[ ]` | — |
 | 9 | Robot detail UI | `[ ]` | — |
@@ -281,6 +281,56 @@ ungrouped rows — 900 samples became 900 points. Bucket starts are now
 The 15 m worst case is 181 aligned buckets, not 180: the cap bounds intervals, and an inclusive
 range on an exact multiple adds the edge bucket.
 
+## Task 6 plan — the live fleet stream
+
+Goal: one SSE connection per screen and a complete fleet snapshot every tick, so the manager never
+refreshes and a stopped simulator still turns robots `offline`. Visual plan with the frame protocol,
+the lifecycle and four decisions: `.lavish/task-6-plan.html`.
+
+| File | Contents |
+|---|---|
+| `app/api/stream/route.ts` | Adapter: `getDb()`, `config.thresholds`, `() => Date.now()`, `getFleetHub()`, then `handleStream`. No `runtime`/`dynamic` export; the build must print `ƒ /api/stream`. |
+| `lib/http/stream.ts` | `handleStream(request, deps)`: `hello` plus an immediate `fleet`, then one frame per `TICK_MS` (1000); `: ping` every `HEARTBEAT_MS` (15 s); abort clears the timer; a throwing tick emits `event: error` and closes. |
+| `lib/stream/hub.ts` | `createFleetHub({ build, tickMs })` — one cached body plus `builtAt`, `invalidate()` — and `getFleetHub()` cached on `globalThis` like `getDb()`. |
+| `lib/stream/client.ts` | Framework-free `FleetStream` with injected `EventSource`/`fetch`: `connecting → live → reconnecting → polling`, the same `FleetResponseBody` from both transports. |
+| `tests/stream.test.ts` | 16 cases (11 server, 5 client) with an injected clock, timer and temp database. |
+
+**Frame contract:** `retry: 2000` and `event: hello` (`tickMs`, `heartbeatMs`, `thresholds`,
+`generatedAt`), then `event: fleet` whose `data` is exactly the `FleetResponseBody` that
+`GET /api/fleet` returns for the same clock, with `id:` set to that snapshot's `generatedAt`.
+`: ping` when idle; `event: error` then close if a tick throws. Every frame is a full snapshot, so a
+lost frame is harmless and the polling fallback is the same body over `fetch`.
+
+**Why the tick cannot be write-driven:** status is `now - receivedAt`, so with no writes only the
+clock changes. A publish-on-write stream would never report `offline`, which is PLAN §1's success
+criterion.
+
+**Sharing:** one cached snapshot per tick serves every connection; each connection owns one timer and
+clears it on abort (no module-level `setInterval`). An accepted ingest calls `hub.invalidate()`
+through a new optional `onAccepted` dep on `handleIngest`, wired in the ingest adapter, so a report
+shows up in the next frame rather than the one after.
+
+**Gate:** `npm run typecheck` · `npm test` (96 expected: 80 + 16) · `npm run lint` · `npm run build`
+(`ƒ /api/stream` in the route table) · then a manual matrix on a backdated seed: `curl -sN` shows
+`hello` then `fleet`; 12 s with no writes flips a robot `moving → delayed → offline` across frames; a
+POST is visible within one tick; two tabs share a `generatedAt`; `POST /api/stream` → 405.
+
+**Open decisions (Lavish):** frame scope (full unfiltered snapshot — recommended — vs filtered per
+connection vs deltas) · hub shape (TTL cache + per-connection timer — recommended — vs shared
+`setInterval` vs no hub) · ingest invalidation (`onAccepted` → `invalidate()` — recommended — vs
+rely on the TTL) · client scope (plain `FleetStream` now, hook in task 8 — recommended — vs React
+hook now vs server only).
+
+**Built (2026-11-21):** approved as planned and shipped with the recommended defaults. New modules:
+`app/api/stream/route.ts`, `lib/http/stream.ts`, `lib/stream/hub.ts`, `lib/stream/client.ts` and
+`tests/stream.test.ts`; `collectFleet`/`summariseFleet`/`buildFleetSnapshot` extracted from the fleet
+handler so the stream and `GET /api/fleet` cannot drift; `onAccepted` added to `handleIngest` and
+wired to `getFleetHub().invalidate()` in the ingest adapter. Two notes from the build: the heartbeat
+is the guard for a tick configured slower than 15 s, not a normal path — at the default 1 s tick a
+frame is always written, and a 13 s capture contained zero `: ping` comments; and the client state
+union gained `idle` and `stopped` beyond the four planned states, because “never started” and “torn
+down” are both worth reporting to a screen.
+
 ## Log
 
 - **2026-11-21 — planning.** Repo was empty (single initial commit). Environment: Node 22.23,
@@ -391,9 +441,58 @@ reported `samplesLastMinute: 1`. Server stopped, port 3100 closed.
   a 25-check matrix against `next start` — default, 1 h and blank windows, 400 on `7m`, 404 on an
   unknown id, 405 on POST, and bucket starts stable across two polls a second apart.
 
+- **2026-11-21 — task 6 done.** `GET /api/stream` ships: `retry: 2000`, a `hello` frame, then a full
+  `FleetResponseBody` per 1 s tick tagged with its `generatedAt` as the event id, plus `event: error`
+  and close if a tick throws. The hub caches one snapshot per tick on `globalThis` and ingest
+  invalidates it through `onAccepted`, so a report lands on the next frame instead of the one after.
+  Gate: typecheck 0, 96/96 tests (16 new: 11 server incl. an abort and the ingest hook, 5 client),
+  lint 0, build 0 with `ƒ /api/stream`. Wire matrix on `next start`: hello and fleet frames exactly
+  as designed, a POST visible on the following frame, two connections sharing one id sequence, and
+  the headline check — a robot seed-posted once then left alone walked moving → delayed → offline
+  across 13 frames. Port 3100 closed afterwards.
+
+- **2026-11-21 — task 6 planned.** The live stream is designed in `.lavish/task-6-plan.html`: `hello`
+  plus a full `FleetResponseBody` per 1 s tick, a TTL snapshot hub on `globalThis`, one timer per
+  connection cleared on abort, `: ping` heartbeats, and a framework-free `FleetStream` client with a
+  polling fallback. Checked in the bundled Next 16 docs that a route handler may return a raw
+  `ReadableStream` (the streaming guide's own SSE example), that the status code is committed once
+  streaming starts, that `X-Accel-Buffering: no` is the documented proxy mitigation, and that
+  `connection()` exists for synchronous drivers like `better-sqlite3` if the route is ever prerendered.
+  Four decisions left open.
+
+## Gate output (task 6, 2026-11-21)
+
+```
+typecheck  0
+test       96/96 pass (11 suites) — 16 new: 11 server (frames, hub, abort, ingest invalidation) + 5 client
+lint       0
+build      0   →   ○ /   ○ /_not-found   ƒ /api/fleet   ƒ /api/ingest   ƒ /api/robots/[id]   ƒ /api/stream
+```
+
+Wire matrix against `next start` on port 3100, temp database seeded by `data/seed-task4.ts`:
+
+```
+GET /api/stream (headers)       200  content-type: text/event-stream; charset=utf-8
+                                    cache-control: no-cache, no-transform
+                                    x-accel-buffering: no, connection: keep-alive
+first bytes on the wire         retry: 2000 → event: hello (tickMs, heartbeatMs, retryMs,
+                                thresholds, generatedAt) → id: <generatedAt> → event: fleet
+POST /api/ingest (2 robots)     200  accepted 2 — RBT-LIVE first seen on fleet frame 2
+RBT-001 over 13 s, one POST then no further writes:
+                                moving (frame 0) → delayed (frame 3) → offline (frame 10)
+13 s capture                    13 fleet frames, ids monotonic, no skipped tick, 0 ping comments
+two connections opened together identical id sequences — one build per tick serves both
+POST /api/stream                405   GET /api/fleet 200 · GET /api/robots/RBT-001 200
+                                POST /api/ingest without key 401
+```
+
+Server stopped, port 3100 closed.
+
 ## Known limitations / open questions
 
-- Single-instance SSE hub (in-process); multi-instance would need Redis pub/sub or a DB tail.
+- Single-instance SSE hub (in-process); multi-instance would need Redis pub/sub or a DB tail. Each
+  frame is the whole fleet, so bandwidth grows linearly with fleet size — fine at this scale,
+  worth revisiting if the fleet reaches the hundreds.
 - SQLite writer is serialized; fine for tens of robots at 1 Hz, not for 1000s.
 - Manager UI has no authentication (ingestion is key-protected).
 - Next 16 has `cacheComponents: true` and `partialPrefetching: true` enabled by the scaffold.

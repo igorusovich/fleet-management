@@ -13,11 +13,15 @@
 import { config } from "@/lib/config";
 import { getDb } from "@/lib/db/client";
 import { handleIngest } from "@/lib/http/ingest";
+import { getFleetHub } from "@/lib/stream/hub";
 
 export async function POST(request: Request): Promise<Response> {
   return handleIngest(request, {
     db: getDb(),
     expectedKey: config.ingestApiKey,
     now: Date.now(),
+    // A report that just landed should be visible on the next frame, not the one
+    // after: drop the cached snapshot instead of waiting for its tick to expire.
+    onAccepted: () => getFleetHub().invalidate(),
   });
 }

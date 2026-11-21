@@ -110,6 +110,40 @@ function emptySummary(): FleetSummary {
   };
 }
 
+/**
+ * Every robot with its status derived against one clock, unfiltered.
+ *
+ * Exported for the stream hub, which caches one snapshot per tick and serves it
+ * to every connection; `handleFleet` reuses it for the filtered path.
+ */
+export function collectFleet(deps: FleetDeps): FleetRobot[] {
+  const { db, thresholds, now } = deps;
+  return listFleet(db, { now }).map((row) =>
+    toFleetRobot(row, deriveStatus(row, now, thresholds), now),
+  );
+}
+
+/** Count each status bucket once. */
+export function summariseFleet(robots: readonly FleetRobot[]): FleetSummary {
+  const summary = emptySummary();
+  for (const robot of robots) {
+    summary.total += 1;
+    summary[robot.status] += 1;
+  }
+  return summary;
+}
+
+/** The unfiltered snapshot: what `GET /api/fleet` returns with no parameters. */
+export function buildFleetSnapshot(deps: FleetDeps): FleetResponseBody {
+  const robots = collectFleet(deps);
+  return {
+    generatedAt: deps.now,
+    thresholds: deps.thresholds,
+    summary: summariseFleet(robots),
+    robots,
+  };
+}
+
 function toFleetRobot(row: FleetRow, status: RobotStatus, now: number): FleetRobot {
   return {
     id: row.robotId,
@@ -134,7 +168,7 @@ function toFleetRobot(row: FleetRow, status: RobotStatus, now: number): FleetRob
 }
 
 export function handleFleet(request: Request, deps: FleetDeps): Response {
-  const { db, thresholds, now } = deps;
+  const { thresholds, now } = deps;
   const params = new URL(request.url).searchParams;
 
   const site = cleanParam(params.get("site"));
@@ -148,28 +182,29 @@ export function handleFleet(request: Request, deps: FleetDeps): Response {
     );
   }
 
-  const needle = search?.toLowerCase();
-  const summary = emptySummary();
-  const robots: FleetRobot[] = [];
-
-  for (const row of listFleet(db, { now })) {
-    if (site !== undefined && row.siteId !== site) continue;
-    if (
-      needle !== undefined &&
-      !row.robotId.toLowerCase().includes(needle) &&
-      !row.name.toLowerCase().includes(needle)
-    ) {
-      continue;
-    }
-
-    const status = deriveStatus(row, now, thresholds);
-    summary.total += 1;
-    summary[status] += 1;
-
-    if (statusFilter !== undefined && status !== statusFilter) continue;
-    robots.push(toFleetRobot(row, status, now));
+  if (site === undefined && search === undefined && statusFilter === undefined) {
+    return Response.json(buildFleetSnapshot(deps));
   }
 
-  const body: FleetResponseBody = { generatedAt: now, thresholds, summary, robots };
+  const needle = search?.toLowerCase();
+  const scoped = collectFleet(deps).filter((robot) => {
+    if (site !== undefined && robot.siteId !== site) return false;
+    if (
+      needle !== undefined &&
+      !robot.id.toLowerCase().includes(needle) &&
+      !robot.name.toLowerCase().includes(needle)
+    ) {
+      return false;
+    }
+    return true;
+  });
+
+  const robots = statusFilter === undefined ? scoped : scoped.filter((robot) => robot.status === statusFilter);
+  const body: FleetResponseBody = {
+    generatedAt: now,
+    thresholds,
+    summary: summariseFleet(scoped),
+    robots,
+  };
   return Response.json(body);
 }
