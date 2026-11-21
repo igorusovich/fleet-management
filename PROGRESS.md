@@ -20,7 +20,7 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done & verified · `[!]`
 | 8 | Fleet overview UI | `[x]` | typecheck 0 · 125/125 tests (14 new) · lint 0 · build 0 (`○ /`) · browser pass: 5 live cards, chip filter, reconnecting badge |
 | 9 | Robot detail UI | `[x]` | typecheck 0 · 138/138 tests (13 new) · lint 0 · build 0 (`◐`) · browser: charge band, gap split, window switch, 404 |
 | 10 | Resilience pass (retention, seeds, README) | `[x]` | typecheck 0 · 149/149 (11 new) · lint 0 · build 0 · e2e: seeded, 5 live, stale page offline at 12 s, sweep deleted exactly the expired row |
-| 11 | Final verification suite | `[ ]` | — |
+| 11 | Final verification suite | `[x]` | lint 0 · typecheck 0 · build 0 · 149/149 (24 suites) · cold start: seed → fleet 0 → 5 curated · detail + SSE · error matrix · offline 5 at 12 s · restart kept 5 |
 
 ## Task 1 plan — pure domain core (`lib/`)
 
@@ -778,6 +778,23 @@ covered by the deterministic gate cases rather than by this run.
   and an end-to-end run on a fresh DB where killing the server under an open page still flipped all
   five cards to `offline` at 12 s.
 
+- **2026-11-21 — task 11 planned.** Final verification is designed in `.lavish/task-11-plan.html`:
+  the PLAN §9 command on the committed tree, then a cold start on a scratch database with an
+  explicit `DATABASE_PATH` and key (seed → build-backed server → 5-robot simulator → fleet, detail
+  and SSE reads → 401/400/404/405 → offline at +11 s → restart survival), then the tracker closed
+  out with the numbers actually printed. Pre-flight on `25e1219` is already green: lint 0,
+  typecheck 0, 149/149 tests (24 suites), build 0. No production code is in scope. Four decisions
+  left open.
+
+- **2026-11-21 — task 11 done.** The full gate ran green on the finished tree — lint 0, typecheck 0,
+  build 0 with the routes unchanged, 149/149 tests (24 suites) — and a cold start on a scratch
+  database proved the first-run path: 20 seeded robots, an empty fleet before any telemetry, 5 live
+  robots with curated metadata after 26 s, 12 detail points with 12 trail rows and real stats, three
+  SSE frames, every documented error path, `offline 5` twelve seconds after the writer stopped, and
+  the same 5 robots after a server restart. No production code changed and no defect surfaced; the
+  only edits are this tracker and its gate record. The suite count in the task-10 block is corrected
+  here: the tree holds 24 `describe` blocks for the same 149 tests.
+
 ## Gate output (task 8, 2026-11-21)
 
 ```
@@ -834,6 +851,7 @@ throughout.
 ```
 typecheck  0
 test       149/149 pass (23 suites) — 11 new: 5 retention · 3 seed · 3 status freshness
+                     (task 11 recounts 24 describe blocks for the same 149 tests — see its gate)
 lint       0
 build      0   →   ○ /   ○ /_not-found   ◐ /robots/[id]   ƒ /api/fleet   ƒ /api/ingest   ƒ /api/robots/[id]   ƒ /api/stream
 ```
@@ -857,6 +875,53 @@ retention probe             RETENTION_HOURS=0.001 on a scratch DB:
 Servers, simulator and browser stopped; ports 3100/3101 closed. The sweeper logs
 `retention deleted=… cutoff=… ms=…` only when a run deletes something, so a quiet sweep leaves no
 noise.
+
+## Gate output (task 11, 2026-11-21)
+
+```
+lint       0
+typecheck  0
+build      0   →   ○ /   ○ /_not-found   ◐ /robots/[id]   ƒ /api/fleet   ƒ /api/ingest   ƒ /api/robots/[id]   ƒ /api/stream
+test       149/149 pass (24 suites) — 0 fail, 0 skipped, 12 test files
+```
+
+Run in PLAN §9's order (`npm run lint && npm run typecheck && npm run build && npm test`) on
+`25e1219` plus the tracker edit, with ports 3000/3100 free so `next build` never rewrote `.next`
+under a dev server.
+
+Cold start on an empty `data/` with `DATABASE_PATH=./data/final.db` and
+`INGEST_API_KEY=final-check-key` passed explicitly on every command, so the working tree's
+`.env.local` could not stand in for the check:
+
+```
+rm data/final.db*                      scratch absent, then created by the seed
+npm run seed                           seed robots=20 database=./data/final.db, exit 0
+GET /api/fleet (before telemetry)      200, total 0, robots [] — metadata is not presence
+node --import tsx simulator/cli.ts …   stopped after 26 ticks · 130 reports · 130 accepted ·
+                                       0 duplicates · 0 rejected · 0 dropped · SIGINT exit 0
+GET /api/fleet                         200, total 5, moving 5; RBT-001 = Atlas 01 ·
+                                       site-berlin · TL-2, seq 1795295497123, 22 samples/min
+GET /api/robots/RBT-001?window=5m      200, window 5m, bucketMs 2000, history 12, trail 12,
+                                       23 reports, avg 68.9 %, 20 m, 0 gaps
+curl -sN /api/stream (3 s)             retry: 2000, 1 hello, 3 fleet frames
+POST /api/ingest without key           401 unauthorized
+POST /api/ingest {"reports":"nope"}    400 invalid_body
+GET /api/robots/NOPE                   404 robot_not_found
+GET /api/robots/RBT-001?window=7m      400 invalid_query, allowed [1m,5m,15m,1h,6h,24h]
+POST /api/stream                       405
+simulator stopped, +12 s               200, total 5, offline 5, moving 0, ages 12s ×5
+server restarted on the same file      200, total 5, offline 5, RBT-001 seq 1795295497127
+```
+
+The simulator was started as `node --import tsx simulator/cli.ts` — the same entry `npm run sim`
+uses — so `SIGINT` reached the process directly rather than an npm wrapper. The scratch database was
+deleted afterwards, both servers stopped, ports 3000 and 3100 closed, and no process left holding
+the file.
+
+No production code changed and phase 2 surfaced no defect. One correction: the task-10 block printed
+“23 suites”; the tree contains 24 `describe` blocks across its 12 test files and the runner counts
+exactly those, so 23 was a transcription error in that line, not a suite that disappeared. All twelve
+rows (0–11) are now `[x]`.
 
 ## Known limitations / open questions
 
