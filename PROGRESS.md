@@ -19,7 +19,7 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done & verified · `[!]`
 | 7 | Robot simulator CLI | `[x]` | typecheck 0 · 111/111 tests (15 new) · lint 0 · build 0 · live run: 473/473 accepted, SIGINT exit 0, wrong key exit 1, offline 20 after stop |
 | 8 | Fleet overview UI | `[x]` | typecheck 0 · 125/125 tests (14 new) · lint 0 · build 0 (`○ /`) · browser pass: 5 live cards, chip filter, reconnecting badge |
 | 9 | Robot detail UI | `[x]` | typecheck 0 · 138/138 tests (13 new) · lint 0 · build 0 (`◐`) · browser: charge band, gap split, window switch, 404 |
-| 10 | Resilience pass (retention, seeds, README) | `[ ]` | — |
+| 10 | Resilience pass (retention, seeds, README) | `[x]` | typecheck 0 · 149/149 (11 new) · lint 0 · build 0 · e2e: seeded, 5 live, stale page offline at 12 s, sweep deleted exactly the expired row |
 | 11 | Final verification suite | `[ ]` | — |
 
 ## Task 1 plan — pure domain core (`lib/`)
@@ -477,6 +477,58 @@ rule then required a Suspense boundary around the screen, which the page provide
 build found: `stats.avgBattery` is nullable when a window has no reports, and the charts split into
 two columns at `lg` rather than `xl`, where the trail map was taller than the viewport.
 
+## Task 10 plan — resilience pass
+
+Goal: PLAN §9 row 10. Four gaps found in the code: `RETENTION_HOURS` is parsed but nothing deletes
+(`.env.example` already promises a sweep), the fleet screen's clock only ages labels while statuses
+stay frozen at the last frame, demo metadata lives only in gitignored `data/seed-*.ts` files, and the
+README is create-next-app boilerplate. Visual plan with both flow diagrams and four decisions:
+`.lavish/task-10-plan.html`.
+
+| File | Change |
+|---|---|
+| `lib/db/schema.ts` | Migration 3: `telemetry_received` index for a global `received_at` cutoff delete. |
+| `lib/db/retention.ts` | `sweepTelemetry`, a 60 s-throttled `createRetentionSweeper`, and `getRetentionSweeper()` on `globalThis`. |
+| `app/api/ingest/route.ts` | `onAccepted` invalidates the hub, then runs the sweeper. |
+| `lib/db/telemetry.ts` | `upsertRobotMetadata` for the seed (updates name/site/model, preserves `created_at`). |
+| `scripts/seed.ts` | `npm run seed`: 20 curated robots matching the simulator ids; `--robots`, `--help`. |
+| `components/fleet/fleet-view.ts` | `refreshStatuses` / `summariseStatuses` reusing `deriveStatus`; chips recount locally. |
+| `components/fleet/fleet-screen.tsx` | Cards, chips, filter and sort read the refreshed robots. |
+| `components/detail/robot-detail-screen.tsx` | Pill re-derived from the payload's receive time and the local clock. |
+| `tests/retention.test.ts`, `tests/seed.test.ts`, `tests/fleet-view.test.ts` | 5 + 2 + 3 cases. |
+| `README.md` | Real quick start, scripts, env, API map, retention semantics, limitations. |
+
+**Sweep rules:** `cutoff = now − retentionHours·3 600 000`; delete `received_at < cutoff` (strict),
+leave `robot_latest` and `robots` untouched, return the count and log it when non-zero. Throttled to
+one run per 60 s, triggered only by an accepted batch. History ages out; the fleet's last-known
+state does not.
+
+**Staleness rule:** the browser runs the server's own `deriveStatus` over each robot with the local
+clock and the frame's thresholds, so a dead socket walks `moving → delayed → offline` on schedule
+and chip counts stay honest. Detail does the same for its pill.
+
+**Gate:** typecheck 0 · test 148/148 (10 new) · lint 0 · build 0 (routes unchanged) · e2e on a fresh
+DB: `npm run seed` → 20 curated robots, simulator 5 robots visible in fleet and detail, stop the
+simulator (and then the server) → cards reach `offline` within 11 s from the stale frame + local
+clock, retention probe with `RETENTION_HOURS=0.001` deletes only the backdated row, README followed
+verbatim.
+
+**Open decisions (Lavish):** sweep trigger (on ingest throttled 60 s — recommended — vs interval
+timer vs read path) · stale status (re-derive all locally and recount chips — recommended — vs
+escalate to offline on cards only vs leave frozen) · seed scope (metadata only, idempotent —
+recommended — vs + backdated history vs destructive `--reset`) · retention vs the 24 h window (keep
+24 h and document partial windows — recommended — vs clamp the window list vs raise to 7 days).
+
+**Built (2026-11-21):** approved and shipped with the recommended defaults. Migration 3 adds
+`telemetry_received`; `lib/db/retention.ts` owns the strict cutoff delete and the 60 s throttle and
+is called from the ingest adapter's `onAccepted`; `upsertRobotMetadata` plus `scripts/seed.ts` give
+`npm run seed`; both screens re-derive `status` with `deriveStatus` on their own clock and the fleet
+chips are recounted from the refreshed list. Two notes from the build: the seed suite covers
+metadata, idempotency and argument parsing in three cases, so the real count is 149 (138 + 11), not
+the planned 148; and the first retention probe posted a bare JSON array, which the ingest contract
+correctly rejected with 400 `invalid_body` — the endpoint takes one report object or
+`{ reports: [...] }`, never an array.
+
 ## Log
 
 - **2026-11-21 — planning.** Repo was empty (single initial commit). Environment: Node 22.23,
@@ -713,6 +765,19 @@ covered by the deterministic gate cases rather than by this run.
   an in-screen not-found state. A gitignored `data/seed-task9.ts` makes charge periods and comms gaps
   demonstrable without waiting 15 minutes. Four decisions left open.
 
+- **2026-11-21 — task 10 planned.** The resilience pass is designed in `.lavish/task-10-plan.html`:
+  a 60 s-throttled retention sweep on accepted ingest (with migration 3 for a global `received_at`
+  index), local re-derivation of statuses so a dead socket still reaches `offline`, an idempotent
+  `npm run seed` for 20 curated robots, and a real README. Gate: 148 tests and an end-to-end run on
+  a fresh database. Four decisions left open.
+
+- **2026-11-21 — task 10 done.** Retention is real (migration 3, strict-cutoff delete, 60 s throttle
+  on accepted ingest), `robot_latest` and `robots` survive it, both screens re-derive status from the
+  local clock so a dead socket reaches `offline`, `npm run seed` curates 20 robots idempotently, and
+  the README documents the actual system. Gate: typecheck 0, 149/149 tests (11 new), lint 0, build 0,
+  and an end-to-end run on a fresh DB where killing the server under an open page still flipped all
+  five cards to `offline` at 12 s.
+
 ## Gate output (task 8, 2026-11-21)
 
 ```
@@ -764,6 +829,35 @@ A note for the next manual pass: `next build` must not run while `next dev` is s
 `.next` under a live dev server left the page reloading itself; production (`next start`) was fine
 throughout.
 
+## Gate output (task 10, 2026-11-21)
+
+```
+typecheck  0
+test       149/149 pass (23 suites) — 11 new: 5 retention · 3 seed · 3 status freshness
+lint       0
+build      0   →   ○ /   ○ /_not-found   ◐ /robots/[id]   ƒ /api/fleet   ƒ /api/ingest   ƒ /api/robots/[id]   ƒ /api/stream
+```
+
+End-to-end on a fresh `data/task10.db`, 5 simulated robots at 1 Hz:
+
+```
+seed                        20 robots upserted, database=./data/task10.db
+GET /api/fleet              total 5, moving 5; RBT-001 = Atlas 01 · site-berlin · TL-2
+GET /api/robots/RBT-001     2 points, 2 trail rows, 0 events at 7 s; window 15m
+browser                     5 cards; chips 5 all · 5 moving · badge “live · 1 s”
+server killed, page open    +12 s → chips 5 offline / 0 moving, every card “offline”,
+                            badge “reconnecting”, “updated 12s ago”
+retention probe             RETENTION_HOURS=0.001 on a scratch DB:
+  before                    telemetry has RBT-SWEEP seq 0, received 60 s ago
+  POST one fresh report     200, accepted 1
+  after                     telemetry holds only seq 1; robot_latest holds seq 1 —
+                            expired history deleted, read model kept
+```
+
+Servers, simulator and browser stopped; ports 3100/3101 closed. The sweeper logs
+`retention deleted=… cutoff=… ms=…` only when a run deletes something, so a quiet sweep leaves no
+noise.
+
 ## Known limitations / open questions
 
 - Single-instance SSE hub (in-process); multi-instance would need Redis pub/sub or a DB tail. Each
@@ -776,3 +870,8 @@ throughout.
 - Next 16 has `cacheComponents: true` and `partialPrefetching: true` enabled by the scaffold.
   Dynamic pages/route handlers must be written against Next 16 conventions; `AGENTS.md` (shipped
   by the scaffold) says to read `node_modules/next/dist/docs/` before writing app code.
+- Retention deletes rows but does not shrink the SQLite file; no automatic VACUUM. Remove
+  `data/fleet.db*` for a clean slate.
+- The fleet and detail screens re-derive status against the **browser** clock. A badly skewed client
+  clock will age robots faster or slower than the server's own view; the server payload's status is
+  only used until the first tick.

@@ -5,9 +5,11 @@ import {
   batteryTone,
   filterRobots,
   formatAge,
+  refreshStatuses,
   sortRobots,
   statusLabel,
   statusSeverity,
+  summariseStatuses,
 } from "../components/fleet/fleet-view";
 import type { FleetRobot } from "../lib/http/fleet";
 
@@ -179,5 +181,45 @@ describe("fleet view — display helpers", () => {
     assert.equal(batteryTone(20, 20), "ok", "the threshold itself is not low");
     assert.equal(statusLabel("low_battery"), "low battery");
     assert.equal(statusLabel("offline"), "offline");
+  });
+});
+
+describe("fleet view — status freshness", () => {
+  const thresholds = { offlineAfterMs: 10_000, delayedAfterMs: 3_000, lowBatteryPct: 20 };
+
+  it("walks a stale moving robot to delayed, then offline, on the local clock", () => {
+    const fleet = [robot({ id: "RBT-001", status: "moving", receivedAt: T0 })];
+
+    assert.equal(refreshStatuses(fleet, T0 + 1_000, thresholds)[0]!.status, "moving");
+    assert.equal(refreshStatuses(fleet, T0 + 3_001, thresholds)[0]!.status, "delayed");
+    assert.equal(refreshStatuses(fleet, T0 + 10_001, thresholds)[0]!.status, "offline");
+    assert.equal(fleet[0]!.status, "moving", "the frame itself is never mutated");
+  });
+
+  it("keeps fault under the threshold and lets offline outrank it past it", () => {
+    const fleet = [
+      robot({ id: "RBT-001", status: "fault", errorCode: "E_STUCK", receivedAt: T0 }),
+    ];
+
+    assert.equal(refreshStatuses(fleet, T0 + 1_000, thresholds)[0]!.status, "fault");
+    assert.equal(refreshStatuses(fleet, T0 + 10_001, thresholds)[0]!.status, "offline");
+  });
+
+  it("recounts the chips from the refreshed statuses", () => {
+    const fleet = [
+      robot({ id: "RBT-001", status: "moving", receivedAt: T0 }),
+      robot({ id: "RBT-002", status: "moving", receivedAt: T0 - 20_000 }),
+    ];
+
+    assert.deepEqual(summariseStatuses(refreshStatuses(fleet, T0, thresholds)), {
+      total: 2,
+      moving: 1,
+      idle: 0,
+      charging: 0,
+      low_battery: 0,
+      fault: 0,
+      delayed: 0,
+      offline: 1,
+    });
   });
 });

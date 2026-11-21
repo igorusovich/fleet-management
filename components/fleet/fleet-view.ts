@@ -10,8 +10,12 @@
  * (or the SQLite driver behind it) reaches the browser bundle.
  */
 
-import type { FleetRobot } from "@/lib/http/fleet";
-import type { RobotStatus } from "@/lib/telemetry/status";
+import type { FleetRobot, FleetSummary } from "@/lib/http/fleet";
+import {
+  deriveStatus,
+  type RobotStatus,
+  type StatusThresholds,
+} from "@/lib/telemetry/status";
 
 /** Most urgent first. This order is the default sort and the chip order. */
 export const STATUS_ORDER = [
@@ -128,4 +132,51 @@ export type BatteryTone = "ok" | "low";
 /** The threshold travels in the frame, so the bar cannot disagree with the server. */
 export function batteryTone(battery: number, lowBatteryPct: number): BatteryTone {
   return battery < lowBatteryPct ? "low" : "ok";
+}
+
+/**
+ * Re-derive statuses against the local clock.
+ *
+ * A frame's `status` was correct when the server built it; if the socket stalls,
+ * it freezes while the clock does not, and a dead fleet keeps claiming to move.
+ * This runs the server's own `deriveStatus` (pure, no I/O) over the frame with
+ * the thresholds the frame carried, so the screen can only follow the same
+ * ladder the server would — offline first, then delayed, then the rest.
+ */
+export function refreshStatuses(
+  robots: readonly FleetRobot[],
+  now: number,
+  thresholds: StatusThresholds,
+): FleetRobot[] {
+  return robots.map((robot) => ({
+    ...robot,
+    status: deriveStatus(
+      {
+        receivedAt: robot.receivedAt,
+        battery: robot.battery,
+        charging: robot.charging,
+        motion: robot.motion,
+        errorCode: robot.errorCode,
+      },
+      now,
+      thresholds,
+    ),
+  }));
+}
+
+/** Health counts over a refreshed list, in the same shape the server sends. */
+export function summariseStatuses(robots: readonly FleetRobot[]): FleetSummary {
+  const summary: FleetSummary = {
+    total: robots.length,
+    moving: 0,
+    idle: 0,
+    charging: 0,
+    low_battery: 0,
+    fault: 0,
+    delayed: 0,
+    offline: 0,
+  };
+
+  for (const robot of robots) summary[robot.status] += 1;
+  return summary;
 }

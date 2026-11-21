@@ -80,6 +80,15 @@ export const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX telemetry_robot_received ON telemetry (robot_id, received_at DESC);
     `,
   },
+  {
+    version: 3,
+    // Retention deletes by `received_at` alone. `telemetry_robot_received`
+    // leads with `robot_id`, so no existing index can serve a global cutoff
+    // scan; without this every sweep reads the whole history table.
+    sql: `
+      CREATE INDEX telemetry_received ON telemetry (received_at);
+    `,
+  },
 ];
 
 /** The version a freshly migrated database reports. */

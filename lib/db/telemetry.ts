@@ -325,6 +325,46 @@ export function ingestReports(
   return write(reports);
 }
 
+/** Display metadata for one robot, as the seed supplies it. */
+export interface RobotMetadata {
+  readonly id: string;
+  readonly name: string;
+  readonly siteId: string;
+  readonly model: string;
+}
+
+/**
+ * Insert or curate display metadata for a list of robots.
+ *
+ * Deliberately updates `name`, `site_id` and `model` but never `created_at`: a
+ * seed re-run is the curation tool, so newer names win, while the robot's age
+ * stays the age of its first appearance. Telemetry is not touched — the
+ * simulator owns history.
+ */
+export function upsertRobotMetadata(
+  db: Database.Database,
+  robots: readonly RobotMetadata[],
+  now: number = Date.now(),
+): number {
+  if (robots.length === 0) return 0;
+
+  const statement = db.prepare(`
+    INSERT INTO robots (id, name, site_id, model, created_at)
+    VALUES (@id, @name, @siteId, @model, @now)
+    ON CONFLICT (id) DO UPDATE SET
+      name    = excluded.name,
+      site_id = excluded.site_id,
+      model   = excluded.model
+  `);
+
+  const write = db.transaction((rows: readonly RobotMetadata[]): number => {
+    for (const row of rows) statement.run({ ...row, now });
+    return rows.length;
+  });
+
+  return write(robots);
+}
+
 /** Every robot's current state, ordered by id so callers get a stable array. */
 export function listLatest(db: Database.Database): LatestRow[] {
   return statements(db).selectAll.all().map(toLatestRow);

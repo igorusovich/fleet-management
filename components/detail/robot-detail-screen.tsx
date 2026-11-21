@@ -6,6 +6,7 @@ import { useEffect, useState } from "react";
 
 import { ageOf, batteryTone, formatAge } from "@/components/fleet/fleet-view";
 import { StatusPill } from "@/components/fleet/status-pill";
+import { deriveStatus } from "@/lib/telemetry/status";
 
 import { BatteryChart } from "./battery-chart";
 import {
@@ -129,6 +130,21 @@ export function RobotDetailScreen() {
 
   const robot = data.robot;
   const current = data.state;
+  // Same rule as the fleet cards: the payload's status is frozen at poll time,
+  // so re-derive it from the receive time and this screen's clock. A stopped
+  // poller then still walks the pill to offline instead of showing a stale
+  // "moving" next to an age that keeps growing.
+  const status = deriveStatus(
+    {
+      receivedAt: current.receivedAt,
+      battery: current.battery,
+      charging: current.charging,
+      motion: current.motion,
+      errorCode: current.errorCode,
+    },
+    clock,
+    data.thresholds,
+  );
   const tone = batteryTone(current.battery, data.thresholds.lowBatteryPct);
   const updated = formatAge(ageOf({ receivedAt: data.generatedAt }, clock));
 
@@ -147,7 +163,7 @@ export function RobotDetailScreen() {
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
             <h1 className="truncate text-xl font-semibold tracking-tight">{robot.name}</h1>
-            <StatusPill status={current.status} />
+            <StatusPill status={status} />
           </div>
           <p className="mt-1 truncate font-mono text-[11px] text-muted">
             {robot.id} · {robot.siteId} · {robot.model}

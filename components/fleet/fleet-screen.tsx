@@ -9,7 +9,9 @@ import {
   STATUS_ORDER,
   filterRobots,
   formatAge,
+  refreshStatuses,
   sortRobots,
+  summariseStatuses,
   statusLabel,
   type SortOrder,
   type StatusFilter,
@@ -156,16 +158,26 @@ export function FleetScreen() {
   const [status, setStatus] = useState<StatusFilter>("all");
   const [sort, setSort] = useState<SortOrder>("severity");
 
-  const robots = snapshot?.robots;
+  // Before the mount effect runs there is no frame either, so the snapshot's own
+  // build time is a safe stand-in for the first paint.
+  const clock = now ?? snapshot?.generatedAt ?? 0;
+
+  // Statuses are re-derived here, every tick, with the server's own rule. The
+  // frame's statuses are only as fresh as the frame; a stalled socket would
+  // otherwise keep every card "moving" while its age climbed.
+  const robots = useMemo(
+    () =>
+      snapshot === null ? [] : refreshStatuses(snapshot.robots, clock, snapshot.thresholds),
+    [snapshot, clock],
+  );
+  const summary = useMemo(() => summariseStatuses(robots), [robots]);
+
   const visible = useMemo(
-    () => sortRobots(filterRobots(robots ?? [], { query, status }), sort),
+    () => sortRobots(filterRobots(robots, { query, status }), sort),
     [robots, query, status, sort],
   );
 
   const total = snapshot?.summary.total ?? 0;
-  // Before the mount effect runs there is no frame either, so the snapshot's own
-  // build time is a safe stand-in for the first paint.
-  const clock = now ?? snapshot?.generatedAt ?? 0;
   const lastUpdate = snapshot === null ? null : formatAge(Math.max(0, clock - snapshot.generatedAt));
   const robotWord = total === 1 ? "robot" : "robots";
 
@@ -200,7 +212,7 @@ export function FleetScreen() {
               <FilterChip
                 key={value}
                 label={statusLabel(value)}
-                count={snapshot.summary[value]}
+                count={summary[value]}
                 pressed={status === value}
                 onClick={() => setStatus(value)}
               />

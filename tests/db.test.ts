@@ -292,7 +292,7 @@ describe("db layer", () => {
     assert.equal(curated.name, "Top Loader");
   });
 
-  it("upgrades a version-1 file in place and adds the receive-time index", () => {
+  it("upgrades a version-1 file in place and adds the receive-time indexes", () => {
     const dir = tempDir();
     const file = path.join(dir, "legacy.db");
     const T1 = T0 + 1_000;
@@ -317,13 +317,19 @@ describe("db layer", () => {
 
     const db = track(openDatabase(file));
 
-    assert.equal(SCHEMA_VERSION, 2);
-    assert.equal(db.pragma("user_version", { simple: true }), 2);
+    assert.equal(SCHEMA_VERSION, 3);
+    assert.equal(db.pragma("user_version", { simple: true }), 3);
 
-    const index = db
-      .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
-      .get("telemetry_robot_received");
-    assert.ok(index, "migration 2 adds the receive-time index");
+    const indexes = db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND name IN (?, ?) ORDER BY name",
+      )
+      .all("telemetry_robot_received", "telemetry_received") as { name: string }[];
+    assert.deepEqual(
+      indexes.map((row) => row.name),
+      ["telemetry_received", "telemetry_robot_received"],
+      "migrations 2 and 3 add both receive-time indexes",
+    );
 
     // The upgrade keeps history and the read model, and the file still writes.
     const latest = listLatest(db);
