@@ -11,7 +11,7 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done & verified · `[!]`
 |---|------|--------|-----------------------|
 | 0 | Scaffold Next.js app + layout + config env | `[x]` | `typecheck` 0 · `lint` 0 · `build` 0 (static `/`) · dev `GET / 200` |
 | 1 | Domain types, zod schemas, status derivation, config | `[x]` | `typecheck` 0 · `npm test` 26/26 pass (5 suites, 0 fail) |
-| 2 | DB layer (schema, repository, latest read model) | `[ ]` | — |
+| 2 | DB layer (schema, repository, latest read model) | `[x]` | 12 db tests pass; typecheck, lint, build green |
 | 3 | `POST /api/ingest` | `[ ]` | — |
 | 4 | `GET /api/fleet` | `[ ]` | — |
 | 5 | `GET /api/robots/:id` | `[ ]` | — |
@@ -76,6 +76,61 @@ schema accepts 0–360 inclusive and `normaliseHeading()` folds into `[0, 360)`;
 never imports it; threshold values reach the browser through the fleet API response (task 4), which
 keeps `INGEST_API_KEY` out of the client bundle.
 
+## Task 2 plan — SQLite storage layer
+
+Goal: give the task-1 types a home. Three tables behind one repository, so tasks 3–5 are
+parse → call → shape. Visual plan with diagrams and open decisions: `.lavish/task-2-plan.html`.
+
+| File | Contents |
+|---|---|
+| `lib/db/schema.ts` | DDL for `telemetry`, `robot_latest`, `robots`; two indexes; `PRAGMA user_version` migration step. |
+| `lib/db/client.ts` | Create the directory, open the file, apply pragmas (WAL, `synchronous=NORMAL`, `busy_timeout=5000`, `foreign_keys=ON`), migrate, cache the handle on `globalThis` so dev HMR does not leak connections. |
+| `lib/db/telemetry.ts` | `ingestReports(db, reports, receivedAt) → {accepted, duplicates}`, `listLatest(db)`, `getLatest(db, robotId)`. Prepared statements; one transaction per batch. |
+| `tests/db.test.ts` | The nine gate cases, on a temp directory per suite. |
+
+**Invariant:** `robot_latest.seq` is the highest seq ever ingested and `received_at` is when that
+report arrived. History accepts late reports; the guarded upsert
+(`WHERE excluded.seq > robot_latest.seq`) never lets one rewind the read model — including its
+`received_at`, so a retried batch cannot make a robot look freshly alive.
+
+**Gate — run 2026-11-21, all green:**
+
+```
+npm run typecheck   # 0
+npm test            # 38 tests, 38 pass, 0 fail (26 from task 1 + 12 new)
+npm run lint        # 0
+npm run build       # 0 — compiled in 437 ms; routes: / and /_not-found
+```
+
+Cases: fresh open (three tables, `journal_mode=wal`, `synchronous=1`, `busy_timeout=5000`,
+`foreign_keys=1`, `user_version=1`, missing parent directories created); first ingest with
+promotion; replayed batch (`duplicates=2`, `received_at` unchanged); late older seq (history grows,
+read model does not move); same seq with a different payload (first write wins); independent
+per-robot seq; `listLatest` ordering and fields; unknown id returns `null`; reopen persistence with
+no re-migration; a second connection reads a committed batch; auto-registration that preserves a
+curated name; empty batch.
+
+**Decisions approved (Lavish, as recommended):** auto-register unknown robots on ingest
+(`name = id`, `site_id = 'unassigned'`, `model = 'unknown'`, `created_at = receivedAt`);
+`PRAGMA user_version` stepwise migrations; temp-file databases in tests.
+
+**Notes from implementation**
+
+- `better-sqlite3` 13.2.0 + `@types/better-sqlite3` 9.6.0 installed; SQLite 3.54.1, prebuilt binary,
+  no compiler needed. `next.config.ts` untouched — Next 16 already externalises the package, and the
+  build confirms it stays server-side.
+- Headings are normalised at ingest (360 → 0) via task 1's `normaliseHeading`, so the stored value is
+  canonical and the UI never has to decide which of two equal bearings to draw.
+- Prepared statements are cached per connection in a `WeakMap` (compiled once, not per tick), and
+  `robot_latest` is only promoted when a report is written to history too — same transaction, so the
+  two tables cannot disagree.
+
+**Verified facts before planning:** `better-sqlite3` 13.2.0, engines `node >=22`, ships no types →
+`@types/better-sqlite3` 9.6.0 (v9 types against a v13 runtime; tracked as risk R4); Next 16 lists
+`better-sqlite3` among automatically externalised server packages, so `next.config.ts` needs no
+change; `node:sqlite` works on Node 22.23 but requires `--experimental-sqlite` and prints an
+`ExperimentalWarning`, which a Next route worker does not get.
+
 ## Log
 
 - **2026-11-21 — planning.** Repo was empty (single initial commit). Environment: Node 22.23,
@@ -108,6 +163,18 @@ keeps `INGEST_API_KEY` out of the client bundle.
   clock skew, and config defaults/overrides/failures.
   The gate caught one real bug: the modulo round-trip turned `91.2` into `91.19999999999999`;
   fixed by returning in-range bearings unchanged.
+
+- **2026-11-21 — task 2 planned.** Storage layer designed in `.lavish/task-2-plan.html`: three
+  tables, one transaction per batch, a seq-guarded read model, four pragmas and nine gate cases.
+  Dependency facts checked before planning: `better-sqlite3` 13.2.0 (Node ≥22, no bundled types,
+  `@types` at 9.6.0), Next 16 auto-externalises it, `node:sqlite` still experimental on 22.23.
+  Three decisions left open for review (robot metadata, migrations, test database).
+
+- **2026-11-21 — task 2 shipped.** `lib/db/schema.ts`, `lib/db/client.ts`, `lib/db/telemetry.ts` and
+  `tests/db.test.ts`. Three tables, stepwise `user_version` migrations, WAL + `synchronous=NORMAL` +
+  `busy_timeout=5000` + `foreign_keys=ON`, one transaction per batch, `ON CONFLICT DO NOTHING` for
+  duplicates and a `WHERE excluded.seq > robot_latest.seq` guard so a late report cannot rewind the
+  read model. Gate: typecheck 0, test 38/38 (12 new), lint 0, build 0.
 
 ## Known limitations / open questions
 
