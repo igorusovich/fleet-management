@@ -71,6 +71,15 @@ export const MIGRATIONS: readonly Migration[] = [
       );
     `,
   },
+  {
+    version: 2,
+    // `samplesLastMinute` counts history rows by *server* receive time, and no
+    // step-1 index covers that column. Without this the count scans a robot's
+    // entire history once per robot on every fleet poll.
+    sql: `
+      CREATE INDEX telemetry_robot_received ON telemetry (robot_id, received_at DESC);
+    `,
+  },
 ];
 
 /** The version a freshly migrated database reports. */

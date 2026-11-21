@@ -13,7 +13,7 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done & verified · `[!]`
 | 1 | Domain types, zod schemas, status derivation, config | `[x]` | `typecheck` 0 · `npm test` 26/26 pass (5 suites, 0 fail) |
 | 2 | DB layer (schema, repository, latest read model) | `[x]` | 12 db tests pass; typecheck, lint, build green |
 | 3 | `POST /api/ingest` | `[x]` | typecheck 0 · 52/52 tests (14 new) · lint 0 · build 0 (`ƒ /api/ingest`) · 8-case curl matrix correct |
-| 4 | `GET /api/fleet` | `[ ]` | — |
+| 4 | `GET /api/fleet` | `[x]` | typecheck 0 · 65/65 tests (13 new) · lint 0 · build 0 (`ƒ /api/fleet`) · 7-case curl matrix correct |
 | 5 | `GET /api/robots/:id` | `[ ]` | — |
 | 6 | SSE `/api/stream` | `[ ]` | — |
 | 7 | Robot simulator CLI | `[ ]` | — |
@@ -188,6 +188,47 @@ Stored state after the matrix: `robot_latest` = RBT-001 seq 2 (battery 90) and R
 `telemetry` = 4 rows with RBT-001 spanning seq 0–2. One log line per accepted request:
 `ingest received=3 accepted=2 duplicates=0 rejected=1 ms=0`. Dev server stopped, port 3100 closed.
 
+## Task 4 plan — the fleet snapshot
+
+Goal: the read the fleet screen lives on. Nothing is written here; the work is joining display
+metadata to the read model, deriving status against a single `now`, and deciding what the health
+counts mean under a filter. Visual plan: `.lavish/task-4-plan.html`.
+
+| File | Contents |
+|---|---|
+| `app/api/fleet/route.ts` | Adapter only: `getDb()`, `config.thresholds`, `Date.now()` → `handleFleet`. No `runtime` or `dynamic` export. |
+| `lib/http/fleet.ts` | `handleFleet(request, { db, thresholds, now })`: parse `site`/`status`/`q`, call the repository, derive status + `ageMs`, filter, count, respond. Plain `Response`, no `next/*` import. |
+| `lib/db/telemetry.ts` | `listFleet(db, { now, windowMs })` — `robots LEFT JOIN robot_latest`, plus a correlated count of telemetry rows with `received_at >= now - 60s`. |
+| `lib/db/schema.ts` | Migration 2: `CREATE INDEX telemetry_robot_received ON telemetry (robot_id, received_at DESC)`; `SCHEMA_VERSION` becomes 2. |
+| `tests/fleet.test.ts` | 12 handler cases on a temp database with a pinned `now`. |
+| `tests/db.test.ts` | 1 new case: a version-1 file migrates to 2 with rows and read model intact. |
+
+**Response:** `{ generatedAt, thresholds, summary, robots[] }`; summary has `total` plus the seven
+status buckets; each robot adds `status`, `ageMs` (clamped at 0) and `samplesLastMinute`. Robots
+ordered by id. Empty fleet is `200` with zeroes, not an error.
+
+**Filters:** `site` exact on `siteId`; `q` case-insensitive substring of id or name; `status` one of
+`ROBOT_STATUSES`, anything else `400 invalid_query` naming the parameter and allowed values. Blank
+values behave like absent ones. Filtering happens in JS because `status` is derived at request time
+and is not a column.
+
+**Gate:** `npm run typecheck` · `npm test` (65 expected: 52 + 13) · `npm run lint` · `npm run build`
+(`ƒ /api/fleet` in the route table) · then 7 curl calls against a temp DB backdated with
+`ingestReports(..., receivedAt)` so every bucket is reachable without a simulator: unfiltered, site,
+q, status, invalid status, unknown site, and `GET /api/ingest` → 405.
+
+**Decisions (confirmed):** the summary counts after `site`/`q` and before `status`, so a status chip
+never zeroes its neighbours; `thresholds` travel in the payload so the UI and the server cannot
+disagree about what `offline` means; `samplesLastMinute` counts by `received_at` and rides the
+migration 2 index. The repository joins from `robot_latest` (not `robots`) so the read model decides
+which robots exist, with `COALESCE` fallbacks for missing metadata.
+
+**Verified in the bundled Next 16 docs:** with `cacheComponents`, `GET` route handlers run at
+request time by default and can be prerendered only when they touch no uncached data — and
+prerendering stops on `req.url`, database queries and `Date.now()`, all of which this handler uses.
+So the route stays dynamic with no `dynamic` or `runtime` export, and unsupported methods still get
+Next's automatic 405.
+
 ## Log
 
 - **2026-11-21 — planning.** Repo was empty (single initial commit). Environment: Node 22.23,
@@ -245,6 +286,46 @@ Stored state after the matrix: `robot_latest` = RBT-001 seq 2 (battery 90) and R
   matched the contract, including a 401 that never parsed the body and a late report that landed in
   history without rewinding `robot_latest`. Decisions: thin route, 400 for all-invalid and empty
   batches.
+
+- **2026-11-21 — task 4 done.** `GET /api/fleet` shipped as `app/api/fleet/route.ts` (adapter) +
+  `lib/http/fleet.ts` (derive once, filter, count) + `listFleet` in `lib/db/telemetry.ts`, with
+  migration 2 adding `telemetry_robot_received`. Gate: typecheck, 65/65 tests (13 new: 12 fleet +
+  1 version-1 upgrade), lint, build (`ƒ /api/fleet`). The 7-call matrix matched, including a
+  `status=fault` request that narrowed the list to one robot while the summary stayed at 7, and a
+  400 that named the parameter and every allowed status. Decisions: summary after site/q and before
+  status, thresholds echoed, sample count by `received_at` on the new index.
+
+- **2026-11-21 — task 4 planned.** Fleet snapshot designed in `.lavish/task-4-plan.html`: one
+  query (`robots LEFT JOIN robot_latest` + a 60 s sample count), status derived once per request
+  with a single `now`, JS-side filters because status is not a column, and a summary that counts
+  after site/q but before status. Adds migration 2 for the `(robot_id, received_at)` index and 13
+  gate cases. Three decisions left open: summary scope, echoing thresholds, sample-count clock.
+
+## Gate output (task 4, 2026-11-21)
+
+```
+typecheck  0
+test       65/65 pass (8 suites) — 12 new fleet cases + 1 migration case
+lint       0
+build      0   →   ○ /   ○ /_not-found   ƒ /api/fleet   ƒ /api/ingest
+```
+
+Seven calls against `next start` on a temp database seeded by `data/seed-task4.ts` — one report per
+robot, each backdated to its intended age, then curated metadata:
+
+```
+GET /api/fleet                  200  total 7, exactly one robot in each of the seven buckets
+GET /api/fleet?site=site-berlin 200  total 3 (moving 1, low_battery 1, delayed 1)
+GET /api/fleet?q=TOP            200  RBT-001 only — case-insensitive on the curated name
+GET /api/fleet?status=fault     200  robots = [RBT-003], summary still total 7 — the decision holds
+GET /api/fleet?status=nope      400  invalid_query {parameter:"status", allowed:[7 statuses]}
+GET /api/fleet?site=nowhere     200  total 0, robots [] — an empty result is not an error
+GET /api/ingest                 405  automatic method rejection
+```
+
+Ages read back as 542 ms / 4 042 ms / 11 042 ms against thresholds of 3 000 / 10 000, so `moving`,
+`delayed` and `offline` came from the real clock path rather than pinned fixtures; every robot
+reported `samplesLastMinute: 1`. Server stopped, port 3100 closed.
 
 ## Known limitations / open questions
 

@@ -122,12 +122,99 @@ const PROMOTE_LATEST = `
 const SELECT_LATEST_ALL = `SELECT ${COLUMNS} FROM robot_latest ORDER BY robot_id`;
 const SELECT_LATEST_ONE = `SELECT ${COLUMNS} FROM robot_latest WHERE robot_id = ?`;
 
+/**
+ * The fleet read: one row per robot that has ever reported.
+ *
+ * `robot_latest` drives the join rather than `robots`, because the read model is
+ * what says a robot has state. A robot row with no telemetry yet (a future seed
+ * step) is not in the fleet view; a telemetry row with no metadata is, with
+ * fallbacks. The sample count is correlated so it stays one statement and one
+ * pass over the receive-time index.
+ */
+const SELECT_FLEET = `
+  SELECT
+    l.robot_id                        AS robot_id,
+    COALESCE(r.name, l.robot_id)      AS name,
+    COALESCE(r.site_id, 'unassigned') AS site_id,
+    COALESCE(r.model, 'unknown')      AS model,
+    l.seq,
+    l.device_ts,
+    l.received_at,
+    l.battery,
+    l.charging,
+    l.motion,
+    l.x,
+    l.y,
+    l.heading,
+    l.speed,
+    l.error_code,
+    (
+      SELECT count(*) FROM telemetry t
+      WHERE t.robot_id = l.robot_id AND t.received_at >= @windowStart
+    ) AS samples_last_minute
+  FROM robot_latest l
+  LEFT JOIN robots r ON r.id = l.robot_id
+  ORDER BY l.robot_id
+`;
+
+/** How far back `samplesLastMinute` counts. */
+export const SAMPLE_WINDOW_MS = 60_000;
+
+/**
+ * One fleet row: the read model plus display metadata and a liveness count.
+ *
+ * Metadata comes through `COALESCE`, so a robot whose `robots` row is missing
+ * (or whose name has not been curated yet) still appears with sane defaults.
+ */
+export interface FleetRow {
+  robotId: string;
+  name: string;
+  siteId: string;
+  model: string;
+  seq: number;
+  deviceTs: number;
+  receivedAt: number;
+  battery: number;
+  charging: boolean;
+  motion: MotionState;
+  x: number;
+  y: number;
+  heading: number;
+  speed: number;
+  errorCode: string | null;
+  samplesLastMinute: number;
+}
+
+interface FleetRowDb {
+  robot_id: string;
+  name: string;
+  site_id: string;
+  model: string;
+  seq: number;
+  device_ts: number;
+  received_at: number;
+  battery: number;
+  charging: number;
+  motion: MotionState;
+  x: number;
+  y: number;
+  heading: number;
+  speed: number;
+  error_code: string | null;
+  samples_last_minute: number;
+}
+
+interface FleetParams {
+  windowStart: number;
+}
+
 interface Statements {
   insertReport: Database.Statement<ReportParams, unknown>;
   touchRobot: Database.Statement<RobotParams, unknown>;
   promoteLatest: Database.Statement<ReportParams, unknown>;
   selectAll: Database.Statement<[], LatestRowDb>;
   selectOne: Database.Statement<[string], LatestRowDb>;
+  selectFleet: Database.Statement<FleetParams, FleetRowDb>;
 }
 
 /**
@@ -145,6 +232,7 @@ function statements(db: Database.Database): Statements {
       promoteLatest: db.prepare<ReportParams, unknown>(PROMOTE_LATEST),
       selectAll: db.prepare<[], LatestRowDb>(SELECT_LATEST_ALL),
       selectOne: db.prepare<[string], LatestRowDb>(SELECT_LATEST_ONE),
+      selectFleet: db.prepare<FleetParams, FleetRowDb>(SELECT_FLEET),
     };
     statementCache.set(db, cached);
   }
@@ -238,4 +326,42 @@ export function listLatest(db: Database.Database): LatestRow[] {
 export function getLatest(db: Database.Database, robotId: string): LatestRow | null {
   const row = statements(db).selectOne.get(robotId);
   return row === undefined ? null : toLatestRow(row);
+}
+
+function toFleetRow(row: FleetRowDb): FleetRow {
+  return {
+    robotId: row.robot_id,
+    name: row.name,
+    siteId: row.site_id,
+    model: row.model,
+    seq: row.seq,
+    deviceTs: row.device_ts,
+    receivedAt: row.received_at,
+    battery: row.battery,
+    charging: row.charging === 1,
+    motion: row.motion,
+    x: row.x,
+    y: row.y,
+    heading: row.heading,
+    speed: row.speed,
+    errorCode: row.error_code,
+    samplesLastMinute: row.samples_last_minute,
+  };
+}
+
+/**
+ * Every robot that has reported, with metadata and its sample count.
+ *
+ * `now` is passed in rather than read here for the same reason as in ingest:
+ * one clock per request, and the caller owns it. Ordered by id so the response
+ * order is deterministic without a sort in the handler.
+ */
+export function listFleet(
+  db: Database.Database,
+  options: { now: number; windowMs?: number },
+): FleetRow[] {
+  const windowMs = options.windowMs ?? SAMPLE_WINDOW_MS;
+  return statements(db)
+    .selectFleet.all({ windowStart: options.now - windowMs })
+    .map(toFleetRow);
 }

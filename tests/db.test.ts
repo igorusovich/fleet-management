@@ -4,10 +4,10 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, describe, it } from "node:test";
 
-import type Database from "better-sqlite3";
+import Database from "better-sqlite3";
 
 import { openDatabase } from "../lib/db/client";
-import { SCHEMA_VERSION } from "../lib/db/schema";
+import { MIGRATIONS, SCHEMA_VERSION } from "../lib/db/schema";
 import { getLatest, ingestReports, listLatest } from "../lib/db/telemetry";
 import type { TelemetryReport } from "../lib/telemetry/schema";
 
@@ -290,6 +290,50 @@ describe("db layer", () => {
       name: string;
     };
     assert.equal(curated.name, "Top Loader");
+  });
+
+  it("upgrades a version-1 file in place and adds the receive-time index", () => {
+    const dir = tempDir();
+    const file = path.join(dir, "legacy.db");
+    const T1 = T0 + 1_000;
+
+    // A real version-1 file: step 1 only, with the version the old code wrote.
+    const legacy = new Database(file);
+    legacy.exec(MIGRATIONS[0]!.sql);
+    legacy.exec("PRAGMA user_version = 1");
+    legacy
+      .prepare("INSERT INTO robots (id, name, site_id, model, created_at) VALUES (?, ?, ?, ?, ?)")
+      .run("RBT-001", "Old Name", "site-berlin", "TL-1", T0);
+    const columns =
+      "robot_id, seq, device_ts, received_at, battery, charging, motion, x, y, heading, speed, error_code";
+    const values = ["RBT-001", 4, T1, T1, 55, 0, "idle", 3, 4, 180, 0, null];
+    legacy
+      .prepare(`INSERT INTO telemetry (${columns}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(...values);
+    legacy
+      .prepare(`INSERT INTO robot_latest (${columns}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(...values);
+    legacy.close();
+
+    const db = track(openDatabase(file));
+
+    assert.equal(SCHEMA_VERSION, 2);
+    assert.equal(db.pragma("user_version", { simple: true }), 2);
+
+    const index = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
+      .get("telemetry_robot_received");
+    assert.ok(index, "migration 2 adds the receive-time index");
+
+    // The upgrade keeps history and the read model, and the file still writes.
+    const latest = listLatest(db);
+    assert.equal(latest.length, 1);
+    assert.equal(latest[0]?.seq, 4);
+    assert.equal(count(db, "telemetry"), 1);
+    assert.deepEqual(ingestReports(db, [report("RBT-001", 5)], T1 + 1_000), {
+      accepted: 1,
+      duplicates: 0,
+    });
   });
 
   it("accepts an empty batch without opening a transaction", () => {
