@@ -18,7 +18,7 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done & verified · `[!]`
 | 6 | SSE `/api/stream` | `[x]` | typecheck 0 · 96/96 tests (16 new) · lint 0 · build 0 (`ƒ /api/stream`) · wire matrix: moving → delayed → offline with no writes |
 | 7 | Robot simulator CLI | `[x]` | typecheck 0 · 111/111 tests (15 new) · lint 0 · build 0 · live run: 473/473 accepted, SIGINT exit 0, wrong key exit 1, offline 20 after stop |
 | 8 | Fleet overview UI | `[x]` | typecheck 0 · 125/125 tests (14 new) · lint 0 · build 0 (`○ /`) · browser pass: 5 live cards, chip filter, reconnecting badge |
-| 9 | Robot detail UI | `[ ]` | — |
+| 9 | Robot detail UI | `[x]` | typecheck 0 · 138/138 tests (13 new) · lint 0 · build 0 (`◐`) · browser: charge band, gap split, window switch, 404 |
 | 10 | Resilience pass (retention, seeds, README) | `[ ]` | — |
 | 11 | Final verification suite | `[ ]` | — |
 
@@ -425,6 +425,58 @@ with query params vs filtering in the stream) · filter state (local component s
 vs URL search params vs shared store) · test scope (pure logic + manual pass — recommended — vs
 jsdom + Testing Library vs manual only).
 
+## Task 9 plan — the robot detail screen
+
+Goal: `/robots/[id]` answers “what has this robot been doing, and is anything about it a problem” —
+header + pill, KPI row, hand-rolled battery chart with a window switch, trail map, window stats and
+the event log. The payload from task 5 already contains all of it. Visual plan:
+`.lavish/task-9-plan.html`.
+
+| File | Contents |
+|---|---|
+| `app/robots/[id]/page.tsx` | Server shell: `await params` (`PageProps<"/robots/[id]">`), render the client screen. Route becomes `ƒ`. |
+| `components/detail/robot-detail-screen.tsx` | `"use client"`: window state, layout, KPI row, charts, events, loading / 404 / stale states. |
+| `components/detail/use-robot-detail.ts` | Fetch `/api/robots/{id}?window=`, poll every 5 s, abort on window change and unmount, keep the last payload on failure. |
+| `components/detail/detail-view.ts` | Pure: `linearScale`, `batterySegments`, `chargeSpans`, `trailProjection`, `formatDistance`, `formatClock`, `eventLabel`, `WINDOW_CHOICES`. |
+| `components/detail/battery-chart.tsx` | Area + line, `lowBatteryPct` threshold, charge bands, gap-split segments, from/to labels, empty-window placeholder. |
+| `components/detail/trail-map.tsx` | Site grid, trail split at gaps, current dot and heading arrow, metre scale. |
+| `components/detail/event-log.tsx` | Newest-first fault / charge_start / comms_gap rows with detail, plus empty state. |
+| `tests/detail-view.test.ts` | 13 cases over the pure module. |
+| `data/seed-task9.ts` | Gitignored gate fixture: 15 min of backdated history with a charge window, a fault burst and a 20 s gap. |
+
+**Data path:** poll the detail endpoint every 5 s (one payload: state, history, trail, events, stats,
+applied window). The stream has no history, so a hybrid would put two clocks on one screen. Abort in
+flight requests on window change and unmount, and ignore a response whose `window.requested` no
+longer matches the selection.
+
+**Charts:** hand-rolled SVG over the echoed window. Segments break where the gap exceeds
+`thresholds.offlineAfterMs` — the same rule stats use — so a 20 s silence is a hole, not a straight
+line; the trail splits the same way. Charge bands come from contiguous `charging` buckets. Bounds for
+the trail are padded and enforced to at least 20 m so a stationary robot does not fill the map. One
+point is a dot, zero points a dashed placeholder; every scale guards a zero-span domain.
+
+**Windows:** `5m`, `15m`, `1h` as local state, default `15m`; ages computed locally from
+`state.receivedAt`; poll skipped while the tab is hidden; a failed refresh keeps the last payload and
+shows its age; 404 renders an in-screen “Robot not found” with the id and a link back.
+
+**Gate:** `npm run typecheck` · `npm test` (138 expected: 125 + 13) · `npm run lint` · `npm run build`
+(`ƒ /robots/[id]`) · then the manual pass on `data/seed-task9.ts`: chart climbing inside the charge
+band, a visible break across the gap, threshold line at `LOW_BATTERY_PCT`, window switching, a live
+detail tab against the simulator, and the 404 and empty-window states.
+
+**Open decisions (Lavish):** data path (5 s poll — recommended — vs fetch once vs stream + slow
+history) · windows (three PLAN names as local state — recommended — vs all six vs three in the URL)
+· fixture (seeded `data/seed-task9.ts` — recommended — vs real time vs simulator at 10×) · 404
+(in-screen state — recommended — vs server `notFound()` vs redirect).
+
+**Built (2026-11-21):** approved and shipped with the recommended defaults, one structural change.
+Reading `params` on the server put the route behind a Cache Components Suspense hole that reflushed
+the document on every request in development, so the id is read with `useParams` on the client and
+the page is a static shell (`◐ /robots/[id]`) whose fallback is the screen's own skeleton. The same
+rule then required a Suspense boundary around the screen, which the page provides. Two fixes the
+build found: `stats.avgBattery` is nullable when a window has no reports, and the charts split into
+two columns at `lg` rather than `xl`, where the trail map was taller than the viewport.
+
 ## Log
 
 - **2026-11-21 — planning.** Repo was empty (single initial commit). Environment: Node 22.23,
@@ -647,6 +699,20 @@ Server stopped, port 3100 closed. Twenty-four ticks is deliberately too short to
 cycle (drain is ~0.03 %/m from a 55–95 % start) or a fault episode (0.2 %/tick); those paths are
 covered by the deterministic gate cases rather than by this run.
 
+- **2026-11-21 — task 9 done.** `/robots/[id]` is live: KPI row, battery chart with charge bands and
+  gap-split segments, trail map with a heading arrow, window stats and the event log, polled every
+  5 s from `GET /api/robots/:id`. Gate: typecheck 0, 138/138 tests (13 new), lint 0, build 0 with
+  `◐ /robots/[id]`, and a browser pass on the seeded fixture that showed two chart segments at the
+  20 s gap, one charge band crossing the 20 % line, two trail runs, the 1h switch fetching a new
+  window, and a 404 rendering “Robot not found” with the id and a way back.
+
+- **2026-11-21 — task 9 planned.** The detail screen is designed in `.lavish/task-9-plan.html`:
+  `/robots/[id]` polls `GET /api/robots/:id` every 5 s and draws the one payload it gets — KPI row,
+  battery chart with charge bands and gap-split segments, trail map with a heading arrow, window
+  stats and the event log. Only 5m/15m/1h are offered, ages are computed locally, and a 404 renders
+  an in-screen not-found state. A gitignored `data/seed-task9.ts` makes charge periods and comms gaps
+  demonstrable without waiting 15 minutes. Four decisions left open.
+
 ## Gate output (task 8, 2026-11-21)
 
 ```
@@ -671,6 +737,33 @@ stop server + simulator  badge “reconnecting”, 5 cards retained
 After the seq fix, a simulator restart on the same database logged `reports=5 accepted=5 dup=0` on
 every tick with `seq` 1795291789440. Server, simulator and browser stopped; port 3000 closed.
 
+## Gate output (task 9, 2026-11-21)
+
+```
+typecheck  0
+test       138/138 pass (21 suites) — 13 new view-logic cases
+lint       0
+build      0   →   ○ /   ○ /_not-found   ◐ /robots/[id]   ƒ /api/fleet   ƒ /api/ingest   ƒ /api/robots/[id]   ƒ /api/stream
+```
+
+Browser pass (Chrome via `chrome-devtools-axi`) on `data/seed-task9.ts` — 900 backdated reports,
+one charge period, one fault burst, one 20 s silence:
+
+```
+15m window, 172 buckets   2 battery paths (gap split) · 1 charge band · “20 %” threshold line
+trail                     2 polylines + heading arrow · “10 m grid · 90° E · 1 gap”
+stats                     158 m · 52 % avg · 687 reports · 1 gap
+events                    comms gap “no reports for 21.0s” · fault E_STUCK · charging started
+KPIs                      69 %, 0.6 m/s, 90° E, sequence 881, error none
+window switch             1h → pressed=1h, “Battery · last 1 hour”, 20:37–21:37
+404                       /robots/NOPE → “Robot not found”, id shown, “Back to the fleet”
+layout                    charts split 760 px / 380 px at 1216 px wide
+```
+
+A note for the next manual pass: `next build` must not run while `next dev` is serving. Rewriting
+`.next` under a live dev server left the page reloading itself; production (`next start`) was fine
+throughout.
+
 ## Known limitations / open questions
 
 - Single-instance SSE hub (in-process); multi-instance would need Redis pub/sub or a DB tail. Each
@@ -678,7 +771,6 @@ every tick with `seq` 1795291789440. Server, simulator and browser stopped; port
   worth revisiting if the fleet reaches the hundreds.
 - The simulator reads flags and exported environment variables only; it does not load `.env.local`,
   so a non-default `INGEST_API_KEY` has to be exported or passed with `--key`.
-- Fleet cards link to `/robots/:id`, which returns 404 until task 9 ships the detail page.
 - SQLite writer is serialized; fine for tens of robots at 1 Hz, not for 1000s.
 - Manager UI has no authentication (ingestion is key-protected).
 - Next 16 has `cacheComponents: true` and `partialPrefetching: true` enabled by the scaffold.
