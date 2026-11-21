@@ -17,7 +17,7 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done & verified · `[!]`
 | 5 | `GET /api/robots/:id` | `[x]` | typecheck 0 · 80/80 tests (15 new) · lint 0 · build 0 (`ƒ /api/robots/[id]`) · 25-check curl matrix passed |
 | 6 | SSE `/api/stream` | `[x]` | typecheck 0 · 96/96 tests (16 new) · lint 0 · build 0 (`ƒ /api/stream`) · wire matrix: moving → delayed → offline with no writes |
 | 7 | Robot simulator CLI | `[x]` | typecheck 0 · 111/111 tests (15 new) · lint 0 · build 0 · live run: 473/473 accepted, SIGINT exit 0, wrong key exit 1, offline 20 after stop |
-| 8 | Fleet overview UI | `[ ]` | — |
+| 8 | Fleet overview UI | `[x]` | typecheck 0 · 125/125 tests (14 new) · lint 0 · build 0 (`○ /`) · browser pass: 5 live cards, chip filter, reconnecting badge |
 | 9 | Robot detail UI | `[ ]` | — |
 | 10 | Resilience pass (retention, seeds, README) | `[ ]` | — |
 | 11 | Final verification suite | `[ ]` | — |
@@ -380,6 +380,51 @@ injection to zero instead of being one-in-five-hundred flaky, while the default 
 per tick; and `speed` is forced to 0 whenever `motion` is not `moving`, so a docked or faulted robot
 cannot contradict its own status with a non-zero speed.
 
+## Task 8 plan — the fleet screen
+
+Goal: the first screen. `/` renders every robot from the live stream, worst first, with health chips,
+search, a status filter and a sort — plus honest loading, empty and reconnecting states. Visual plan:
+`.lavish/task-8-plan.html`.
+
+| File | Contents |
+|---|---|
+| `app/page.tsx` | Server shell: heading plus `<FleetScreen />`; still a static `○ /` route. |
+| `components/fleet/fleet-screen.tsx` | `"use client"`. Filter/sort state, summary, controls, grid, and the three non-data states. |
+| `components/fleet/use-fleet-stream.ts` | One `FleetStream`, started on mount and stopped on unmount, exposing `{ snapshot, state, error }`. |
+| `components/fleet/fleet-view.ts` | Pure `filterRobots`, `sortRobots`, `statusSeverity`, `formatAge`, `batteryTone` — no React import. |
+| `components/fleet/status-pill.tsx` | One status → one pill (colour plus text), shared with task 9. |
+| `components/fleet/robot-card.tsx` | Pill, name/id, site/model, battery bar, motion/speed or fault, position, age, seq; the card is one link. |
+| `tests/fleet-view.test.ts` | 12 cases over the pure module. |
+| `app/globals.css` | Status colour tokens (`ok`, `warn`, `bad`, `violet`) beside the existing palette. |
+
+**Boundary:** the frame is the single source. `status`, `summary` and `thresholds` are read, never
+recomputed in the browser; filtering and sorting are pure functions over the snapshot already in
+memory, so a chip click costs no request and the chips cannot disagree with the cards. The chips show
+the server's unfiltered counts (the stream is unfiltered, unlike `GET /api/fleet?status=`, which
+recounts after `site`/`q`).
+
+**Severity order** (default sort): `offline → fault → low_battery → delayed → charging → moving →
+idle`, ties by battery ascending then id, so the order is total and stable. Other sorts: battery
+ascending, id ascending. No mutation of the snapshot.
+
+**Age** is computed locally from `receivedAt` against a 1 s clock rather than the payload's frozen
+`ageMs`, so a stalled socket shows ageing cards and the badge says `reconnecting` instead of a screen
+that looks alive.
+
+**States:** no frame yet → skeleton cards; `total 0` → empty panel naming `npm run sim`; robots but
+no matches → “No robots match” plus clear; `reconnecting`/`polling` → amber badge, cards retained.
+
+**Gate:** `npm run typecheck` · `npm test` (123 expected: 111 + 12) · `npm run lint` · `npm run build`
+(`○ /` still static) · then a manual pass: cards within a second of the simulator starting, filters
+instant, badge on server stop/restart, offline cards after 11 s, empty fleet, keyboard toggling of
+chips.
+
+**Open decisions (Lavish):** data path (hook over `FleetStream` — recommended — vs inline
+`EventSource` vs polling only) · filtering (client-side over the snapshot — recommended — vs refetch
+with query params vs filtering in the stream) · filter state (local component state — recommended —
+vs URL search params vs shared store) · test scope (pure logic + manual pass — recommended — vs
+jsdom + Testing Library vs manual only).
+
 ## Log
 
 - **2026-11-21 — planning.** Repo was empty (single initial commit). Environment: Node 22.23,
@@ -551,6 +596,30 @@ POST /api/stream                405   GET /api/fleet 200 · GET /api/robots/RBT-
 
 Server stopped, port 3100 closed.
 
+- **2026-11-21 — task 8 planned.** The fleet screen is designed in `.lavish/task-8-plan.html`: `/`
+  becomes a client screen fed by one `FleetStream` connection, with health chips, search, status
+  filter and severity sort computed client-side over the unfiltered snapshot. Status, summary and
+  thresholds stay server-derived; age is computed locally so a stalled socket ages instead of
+  freezing.
+
+- **2026-11-21 — task 8 done.** The fleet screen ships at `/`: one `FleetStream` connection, health
+  chips that double as the status filter, search, severity/battery/id sort, cards with battery bars
+  and locally computed ages, plus skeleton, empty, no-match and reconnecting states. Gate: typecheck
+  0, 125/125 tests (14 new), lint 0, build 0 with `/` still `○`, and a browser pass that filtered to
+  the zero-count fault chip, cleared it from the empty state, and watched the badge turn
+  `reconnecting` when the server stopped. That pass also found a task 7 bug — a restarted simulator
+  replayed `seq` from 0, so every report was a duplicate against an existing database — now fixed
+  with a startup `seqBase` and a regression test. Four decisions left open.
+
+**Built (2026-11-21):** approved as planned and shipped with the recommended defaults. Six modules
+under `components/fleet/` plus `tests/fleet-view.test.ts`; `/` stays a static shell. Two notes from
+the build: Next 16 blocks `Date.now()` while prerendering a client component
+(`blocking-prerender-current-time-client`), so the screen's clock starts `null`, dates the first
+paint from the frame's `generatedAt`, and only reads the wall clock on the interval; and the manual
+pass caught a task 7 defect — a restarted simulator replayed `seq` from 0, so every report was a
+duplicate and the fleet went stale while the CLI looked healthy. `createFleet` now takes a `seqBase`
+and the CLI passes its start time, with a regression test.
+
 ## Gate output (task 7, 2026-11-21)
 
 ```
@@ -578,6 +647,30 @@ Server stopped, port 3100 closed. Twenty-four ticks is deliberately too short to
 cycle (drain is ~0.03 %/m from a 55–95 % start) or a fault episode (0.2 %/tick); those paths are
 covered by the deterministic gate cases rather than by this run.
 
+## Gate output (task 8, 2026-11-21)
+
+```
+typecheck  0
+test       125/125 pass (16 suites) — 14 new: 13 view-logic cases + 1 simulator seq-base regression
+lint       0
+build      0   →   ○ /   ○ /_not-found   ƒ /api/fleet   ƒ /api/ingest   ƒ /api/robots/[id]   ƒ /api/stream
+```
+
+Browser pass (Chrome via `chrome-devtools-axi`) against `npm run dev` and `npm run sim -- --robots 5`:
+
+```
+page                     5 cards, “5 robots · updated just now”, badge “live · 1 s”
+chips                    5 all (pressed) · 0 offline · 0 fault · 0 low battery · 0 delayed ·
+                         0 charging · 4 moving · 1 idle
+battery bar              RBT-002 fill 344 px of a 536 px track at 64.1 % — the width is data-driven
+chip “fault” (count 0)   “No robots match” + “Clear filters”, 0 cards
+clear filters            5 cards, “5 all” pressed again
+stop server + simulator  badge “reconnecting”, 5 cards retained
+```
+
+After the seq fix, a simulator restart on the same database logged `reports=5 accepted=5 dup=0` on
+every tick with `seq` 1795291789440. Server, simulator and browser stopped; port 3000 closed.
+
 ## Known limitations / open questions
 
 - Single-instance SSE hub (in-process); multi-instance would need Redis pub/sub or a DB tail. Each
@@ -585,6 +678,7 @@ covered by the deterministic gate cases rather than by this run.
   worth revisiting if the fleet reaches the hundreds.
 - The simulator reads flags and exported environment variables only; it does not load `.env.local`,
   so a non-default `INGEST_API_KEY` has to be exported or passed with `--key`.
+- Fleet cards link to `/robots/:id`, which returns 404 until task 9 ships the detail page.
 - SQLite writer is serialized; fine for tens of robots at 1 Hz, not for 1000s.
 - Manager UI has no authentication (ingestion is key-protected).
 - Next 16 has `cacheComponents: true` and `partialPrefetching: true` enabled by the scaffold.

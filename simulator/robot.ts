@@ -109,11 +109,18 @@ export interface FleetOptions {
   readonly robots: number;
   readonly seed?: number;
   readonly prefix?: string;
+  /**
+   * First `seq` for every robot. The CLI passes the start time so a restarted
+   * simulator continues above the previous run instead of replaying from 0,
+   * which the ingest endpoint would reject as duplicates forever.
+   */
+  readonly seqBase?: number;
 }
 
 export function createFleet(options: FleetOptions): Robot[] {
   const seed = options.seed ?? 42;
   const prefix = options.prefix ?? "RBT";
+  const seqBase = options.seqBase ?? 0;
   const fleet: Robot[] = [];
 
   for (let index = 0; index < options.robots; index += 1) {
@@ -123,7 +130,7 @@ export function createFleet(options: FleetOptions): Robot[] {
     const robot: Robot = {
       id,
       random,
-      seq: 0,
+      seq: seqBase,
       mode: "cruising",
       battery: INITIAL_BATTERY_MIN + random() * (INITIAL_BATTERY_MAX - INITIAL_BATTERY_MIN),
       x: (random() * 2 - 1) * WAYPOINT_BOUNDS_M * 0.8,

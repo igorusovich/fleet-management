@@ -58,7 +58,9 @@ async function postReports(config: SimConfig, reports: TelemetryReport[]): Promi
 }
 
 async function run(config: SimConfig): Promise<number> {
-  const fleet = createFleet({ robots: config.robots, seed: config.seed });
+  // A restart must not replay seq 0: those reports already exist, so every batch
+  // would be rejected as duplicates and the fleet would silently go stale.
+  const fleet = createFleet({ robots: config.robots, seed: config.seed, seqBase: Date.now() });
   const dropRandom = createRandom(config.seed ^ 0x85ebca6b);
   const startedAt = Date.now();
 

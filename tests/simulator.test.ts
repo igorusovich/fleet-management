@@ -76,6 +76,20 @@ describe("simulator fleet model", () => {
     );
   });
 
+  it("starts seq at the given base, so a restart is not a replay", () => {
+    const fleet = createFleet({ robots: 2, seed: 2, seqBase: 5_000 });
+    assert.deepEqual(
+      fleet.map((robot) => robot.seq),
+      [5_000, 5_000],
+    );
+
+    const { reports } = tickFleet(fleet, { dtSeconds: 1, now: T0, dropRate: 0 });
+    assert.deepEqual(
+      reports.map((report) => report.seq),
+      [5_001, 5_001],
+    );
+  });
+
   it("only ever emits reports the ingest schema accepts", () => {
     const fleet = createFleet({ robots: 5, seed: 21 });
 

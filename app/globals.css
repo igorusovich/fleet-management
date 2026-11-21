@@ -10,6 +10,12 @@
   --color-muted: #93a1b1;
   --color-accent: #4cc2ff;
 
+  /* Status tones: one colour per severity, mirroring the ops palette. */
+  --color-ok: #34d399;
+  --color-warn: #fbbf24;
+  --color-bad: #f87171;
+  --color-violet: #c084fc;
+
   --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
   --font-mono: var(--font-geist-mono), ui-monospace, SFMono-Regular, monospace;
 }
