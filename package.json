@@ -8,7 +8,8 @@
     "start": "next start",
     "lint": "eslint",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test tests/*.test.ts"
+    "test": "node --import tsx --test tests/*.test.ts",
+    "sim": "tsx simulator/cli.ts"
   },
   "dependencies": {
     "better-sqlite3": "^13.2.0",

@@ -16,7 +16,7 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done & verified · `[!]`
 | 4 | `GET /api/fleet` | `[x]` | typecheck 0 · 65/65 tests (13 new) · lint 0 · build 0 (`ƒ /api/fleet`) · 7-case curl matrix correct |
 | 5 | `GET /api/robots/:id` | `[x]` | typecheck 0 · 80/80 tests (15 new) · lint 0 · build 0 (`ƒ /api/robots/[id]`) · 25-check curl matrix passed |
 | 6 | SSE `/api/stream` | `[x]` | typecheck 0 · 96/96 tests (16 new) · lint 0 · build 0 (`ƒ /api/stream`) · wire matrix: moving → delayed → offline with no writes |
-| 7 | Robot simulator CLI | `[ ]` | — |
+| 7 | Robot simulator CLI | `[x]` | typecheck 0 · 111/111 tests (15 new) · lint 0 · build 0 · live run: 473/473 accepted, SIGINT exit 0, wrong key exit 1, offline 20 after stop |
 | 8 | Fleet overview UI | `[ ]` | — |
 | 9 | Robot detail UI | `[ ]` | — |
 | 10 | Resilience pass (retention, seeds, README) | `[ ]` | — |
@@ -331,6 +331,55 @@ frame is always written, and a 13 s capture contained zero `: ping` comments; an
 union gained `idle` and `stopped` beyond the four planned states, because “never started” and “torn
 down” are both worth reporting to a screen.
 
+## Task 7 plan — the simulator
+
+Goal: the only writer. A separate Node process models N robots at 1 Hz and posts one batch a
+second through the real ingest door, so every derived status — `low_battery`, `charging`, `fault`,
+`delayed`, `offline` — becomes reachable. Visual plan: `.lavish/task-7-plan.html`.
+
+| File | Contents |
+|---|---|
+| `simulator/robot.ts` | `createRandom(seed)` (mulberry32), `createFleet`, `advanceRobot(robot, dtSeconds)`, `toReport(robot, ts)`, constants. Imports only the type and `normaliseHeading` from the schema — never the database. |
+| `simulator/args.ts` | `parseArgs(argv, env)` → `SimConfig` and `usage()`; flags over `SIM_*` over defaults; returns errors instead of exiting, so the gate can assert them. |
+| `simulator/cli.ts` | The only I/O: fixed-grid tick loop, one `fetch` per tick with a 5 s timeout, the per-tick log line, SIGINT summary, exit codes. |
+| `tests/simulator.test.ts` | 15 cases: 12 model (determinism, seq, drain, dock, bounds, faults, drops) + 3 args. |
+
+**Model:** waypoint cruising inside ±40 m; battery drains 0.03 %/m travelled (proportional to speed);
+below 18 % it returns to the dock at (0,0) and charges at 0.5 %/s to 95 %; random fault episodes
+(`E_STUCK`/`E_LIDAR`/`E_WHEEL_SLIP`, 3–8 s) overlay movement; `--drop-rate` omits a report but still
+advances `seq`, so loss looks like a seq gap rather than a duplicate.
+
+**Wire mapping:** cruising/returning → `moving`, idle → `idle`, charging → `motion: "charging"` with
+`charging: true`, fault → `motion: "error"` with the code. `charging` is never `false` on a charging
+report and never `true` while returning.
+
+**Loop:** a grid anchored at start (`sleep until start + n·interval`, not `sleep(interval)`), one
+request in flight, a request that overruns its slot skips the next instead of firing back to back.
+Logs `t= reports= accepted= dup= rejected= skipped= rtt=`, counts taken from the ingest response.
+401/403 → message naming `x-ingest-key` and `exit(1)`; 400/5xx/network → warn and keep ticking;
+SIGINT → finish the in-flight request, print the summary, `exit(0)`.
+
+**Config:** `--robots --interval --url --key --seed --drop-rate` with `SIM_ROBOTS`, `SIM_INTERVAL_MS`,
+`SIM_URL`, `SIM_SEED`, `SIM_DROP_RATE` and `INGEST_API_KEY` as fallbacks; defaults 20 robots, 1000 ms,
+`http://localhost:3000/api/ingest`, seed 42, drop 0.02. New `npm run sim` script.
+
+**Gate:** `npm run typecheck` · `npm test` (111 expected: 96 + 15) · `npm run lint` · `npm run build`
+· then the PLAN §9 row 7 matrix: 30 s of 20 robots advancing in the DB with one tick line per second,
+`exit=0` on SIGINT, and a wrong key exiting 1 naming the header; finally stopping the simulator and
+watching the fleet read `offline` after 11 s.
+
+**Open decisions (Lavish):** home (standalone `simulator/` CLI — recommended — vs in-app route vs
+seed script) · model (waypoints + dock + faults — recommended — vs random walk vs scripted scenario)
+· loop (fixed grid, skip-not-queue — recommended — vs fire-and-forget interval vs await-then-sleep)
+· config (flags over `SIM_*` over defaults — recommended — vs env only vs flags only).
+
+**Built (2026-11-21):** approved as planned and shipped with the recommended defaults. Three
+modules under `simulator/`, `tests/simulator.test.ts` and the `npm run sim` script. Two notes from
+the build: `advanceRobot` takes an optional `faultRate` so the dock and fault cases pin fault
+injection to zero instead of being one-in-five-hundred flaky, while the default keeps PLAN's 0.2 %
+per tick; and `speed` is forced to 0 whenever `motion` is not `moving`, so a docked or faulted robot
+cannot contradict its own status with a non-zero speed.
+
 ## Log
 
 - **2026-11-21 — planning.** Repo was empty (single initial commit). Environment: Node 22.23,
@@ -460,6 +509,20 @@ reported `samplesLastMinute: 1`. Server stopped, port 3100 closed.
   `connection()` exists for synchronous drivers like `better-sqlite3` if the route is ever prerendered.
   Four decisions left open.
 
+- **2026-11-21 — task 7 planned.** The simulator is designed in `.lavish/task-7-plan.html` as a
+  standalone `simulator/` CLI (`robot.ts` pure model, `args.ts`, `cli.ts`) that posts one batch per
+  second through the real ingest endpoint. Every derived status becomes reachable: waypoint cruising,
+  distance-proportional drain, a dock cycle at 18 %/95 %, fault episodes, and a drop rate that leaves
+  seq gaps. The tick loop is a fixed grid anchored at start with one request in flight, skipping a
+  slot rather than bursting after a slow response; 401 exits 1. Four decisions left open.
+
+- **2026-11-21 — task 7 done.** The simulator ships as `simulator/robot.ts` (pure seeded model),
+  `simulator/args.ts` and `simulator/cli.ts`, with `npm run sim`. Gate: typecheck 0, 111/111 tests
+  (15 new), lint 0, build 0. Live run of 20 robots at 1 Hz against `next start`: 24 ticks, 473
+  reports, 473 accepted, 7 dropped by the 2 % drop rate, 0 duplicates, 0 rejected; `SIGINT` printed
+  the summary and exited 0; a wrong key exited 1 naming `x-ingest-key`; and stopping the writer left
+  the fleet reading `offline 20` after 11 s. Port 3100 closed afterwards.
+
 ## Gate output (task 6, 2026-11-21)
 
 ```
@@ -488,11 +551,40 @@ POST /api/stream                405   GET /api/fleet 200 · GET /api/robots/RBT-
 
 Server stopped, port 3100 closed.
 
+## Gate output (task 7, 2026-11-21)
+
+```
+typecheck  0
+test       111/111 pass (13 suites) — 15 new: 12 model + 3 argument cases
+lint       0
+build      0   →   ƒ /api/fleet · ƒ /api/ingest · ƒ /api/robots/[id] · ƒ /api/stream
+```
+
+`npm run sim -- --help` exits 0 with the usage block; `--robots 0` and `--nope` exit 1 naming the
+flag. Live matrix against `next start -p 3100` on a fresh database, 20 robots at 1 Hz:
+
+```
+fleet at 8 s             total 20, moving 20; RBT-001 battery 69, name RBT-001,
+                         site unassigned, seq 7, samplesLastMinute 7
+stream, 3 s              3 fleet frames; RBT-001 69 % @3.01,4.2 → 68.9 % @1.86,4.44 → 68.9 % @0.83,4.65
+tick log                 t=23 reports=19 accepted=19 dup=0 rejected=0 skipped=0 rtt=11ms
+SIGINT                   exit 0 · stopped after 24 ticks · 473 reports · 473 accepted ·
+                         0 duplicates · 0 rejected · 7 dropped · 0 failed · 0 skipped · 23.0 s
+wrong key                401 naming x-ingest-key, exit 1 after one tick
+writer stopped, +11 s    total 20, offline 20, moving 0   ← PLAN §1 success criterion
+```
+
+Server stopped, port 3100 closed. Twenty-four ticks is deliberately too short to reach the dock
+cycle (drain is ~0.03 %/m from a 55–95 % start) or a fault episode (0.2 %/tick); those paths are
+covered by the deterministic gate cases rather than by this run.
+
 ## Known limitations / open questions
 
 - Single-instance SSE hub (in-process); multi-instance would need Redis pub/sub or a DB tail. Each
   frame is the whole fleet, so bandwidth grows linearly with fleet size — fine at this scale,
   worth revisiting if the fleet reaches the hundreds.
+- The simulator reads flags and exported environment variables only; it does not load `.env.local`,
+  so a non-default `INGEST_API_KEY` has to be exported or passed with `--key`.
 - SQLite writer is serialized; fine for tens of robots at 1 Hz, not for 1000s.
 - Manager UI has no authentication (ingestion is key-protected).
 - Next 16 has `cacheComponents: true` and `partialPrefetching: true` enabled by the scaffold.
